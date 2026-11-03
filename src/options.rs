@@ -135,6 +135,10 @@ pub struct Options {
     pub context_menus: Vec<ContextMenu>,
     pub menu_confirm_buttons: Vec<Button>,
     pub menu_confirm_keys: Vec<String>,
+    pub touch_plates: bool,
+    pub menu_back_buttons: Vec<Button>,
+    pub menu_back_keys: Vec<String>,
+    pub plate_nav_exclude: Vec<u32>,
     pub key_to_touch: Vec<(String, f32, f32)>,
     pub keys_to_dpad: Option<[String; 4]>,
     pub device_id: Option<String>,
@@ -178,6 +182,10 @@ impl Default for Options {
             context_menus: Vec::new(),
             menu_confirm_buttons: Vec::new(),
             menu_confirm_keys: Vec::new(),
+            touch_plates: false,
+            menu_back_buttons: Vec::new(),
+            menu_back_keys: Vec::new(),
+            plate_nav_exclude: Vec::new(),
             key_to_touch: Vec::new(),
             keys_to_dpad: None,
             device_id: None,
@@ -314,6 +322,18 @@ impl Options {
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--menu-confirm-button=") {
             self.menu_confirm_buttons.push(parse_button_name(value)?);
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--menu-back-button=") {
+            self.menu_back_buttons.push(parse_button_name(value)?);
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--menu-back-key=") {
+            self.menu_back_keys.push(value.to_string());
+            return Ok(true);
+        } else if arg == "--touch-plate-nav" {
+            self.touch_plates = true;
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--plate-nav-exclude=") {
+            self.plate_nav_exclude.extend(parse_contexts(value)?);
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--menu-confirm-key=") {
             self.menu_confirm_keys.push(value.to_string());

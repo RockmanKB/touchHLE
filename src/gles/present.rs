@@ -94,16 +94,29 @@ pub unsafe fn present_frame(
 
         gles.Enable(gles11::BLEND);
         gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
-        gles.Color4f(0.0, 0.0, 0.0, if pressed { 2.0 / 3.0 } else { 1.0 / 3.0 });
 
-        let radius = 10.0;
-
-        let mut vertices = vertices;
-        for i in (0..vertices.len()).step_by(2) {
-            vertices[i] = (vertices[i] * radius + x) / (vw as f32 / 2.0) - 1.0;
-            vertices[i + 1] = 1.0 - (vertices[i + 1] * radius + y) / (vh as f32 / 2.0);
+        // Local: draw a dark outline with a bright centre so the cursor is
+        // visible on both light and dark screens. Colours are premultiplied.
+        let layers: [(f32, [f32; 4]); 2] = [
+            (13.0, [0.0, 0.0, 0.0, 0.85]),
+            (
+                9.0,
+                if pressed {
+                    [0.95, 0.75, 0.25, 0.95]
+                } else {
+                    [0.95, 0.95, 0.95, 0.85]
+                },
+            ),
+        ];
+        for (radius, [r, g, b, a]) in layers {
+            gles.Color4f(r * a, g * a, b * a, a);
+            let mut vertices = vertices;
+            for i in (0..vertices.len()).step_by(2) {
+                vertices[i] = (vertices[i] * radius + x) / (vw as f32 / 2.0) - 1.0;
+                vertices[i + 1] = 1.0 - (vertices[i + 1] * radius + y) / (vh as f32 / 2.0);
+            }
+            gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
+            gles.DrawArrays(gles11::TRIANGLES, 0, 6);
         }
-        gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
-        gles.DrawArrays(gles11::TRIANGLES, 0, 6);
     }
 }

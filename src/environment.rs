@@ -1430,17 +1430,62 @@ impl Environment {
                     // Local: read the app's screen-state values for
                     // context-dependent input mapping.
                     let base: u32 = self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(ptr));
-                    let vals: Vec<u32> = if base >= 0x1000 {
-                        offs.iter()
-                            .map(|&o| {
-                                self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(base + o))
-                            })
-                            .collect()
-                    } else {
+                    let read = |o: u32| -> u32 {
+                        self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(base + o))
+                    };
+                    let vals: Vec<u32> = if base < 0x1000 {
                         Vec::new()
+                    } else if offs.len() == 3 {
+                        // PRIMARY,FLAG,ALTERNATE: if the byte at FLAG is
+                        // non-zero the app uses the alternate state slot.
+                        let flag: u8 = self
+                            .mem
+                            .read(crate::mem::ConstPtr::<u8>::from_bits(base + offs[1]));
+                        vec![if flag != 0 { read(offs[2]) } else { read(offs[0]) }]
+                    } else {
+                        offs.iter().map(|&o| read(o)).collect()
                     };
                     if let Some(ref mut window) = self.window {
                         window.set_context(vals, &self.options);
+                    }
+                    // Local: read the app's on-screen buttons ("touch plates"):
+                    // a per-frame list of up to 50 task pointers at +0x1774 with
+                    // the count at +0x19d8 (Double Dragon's APPLET layout).
+                    if self.options.touch_plates && base >= 0x1000 {
+                        let r32 = |a: u32| -> u32 {
+                            self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(a))
+                        };
+                        let r16 = |a: u32| -> i16 {
+                            self.mem.read(crate::mem::ConstPtr::<i16>::from_bits(a))
+                        };
+                        let n = r16(base + 0x19d8).clamp(0, 50) as u32;
+                        let mut plates = Vec::new();
+                        for i in 0..n {
+                            let t = r32(base + 0x1774 + 4 * i);
+                            if t < 0x1000 {
+                                continue;
+                            }
+                            let (x, y) = (r32(t + 0x5c) as i32, r32(t + 0x60) as i32);
+                            let (w, h) = (r32(t + 0x198) as i32, r32(t + 0x19c) as i32);
+                            let (ax, ay) = (r32(t + 0x1a0) as i32, r32(t + 0x1a4) as i32);
+                            if w <= 0 || h <= 0 || w > 480 || h > 320 {
+                                continue;
+                            }
+                            let cx = (x - ax) as f32 + w as f32 / 2.0;
+                            let cy = (y - ay) as f32 + h as f32 / 2.0;
+                            if !(0.0..=480.0).contains(&cx) || !(0.0..=320.0).contains(&cy) {
+                                continue;
+                            }
+                            plates.push(crate::window::Plate {
+                                cx,
+                                cy,
+                                flags: r32(t + 0x48),
+                                num: r32(t + 0x1c8) as i32,
+                            });
+                        }
+                        if let Some(ref mut window) = self.window {
+                            window.set_plates(plates, &self.options);
+                        }
                     }
                 }
                 if let Some(ref mut window) = self.window {

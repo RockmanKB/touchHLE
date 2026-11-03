@@ -134,6 +134,15 @@ pub enum FingerId {
 }
 pub type Coords = (f32, f32);
 
+/// Local: an on-screen button reported by the app (see `--touch-plate-nav`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plate {
+    pub cx: f32,
+    pub cy: f32,
+    pub flags: u32,
+    pub num: i32,
+}
+
 /// Local: an input that screen-dependent rules can match.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum CtxInput {
@@ -270,9 +279,16 @@ pub struct Window {
     ctx_swallowed: std::collections::HashSet<CtxInput>,
     menu_sel: Option<(u32, usize)>,
     menu_pointer: Option<(f32, f32)>,
+    menu_ctx_active: bool,
+    plates: Vec<Plate>,
+    plates_seen: Vec<(Instant, Vec<Plate>)>,
+    plate_sel: Option<(f32, f32)>,
+    plate_user_moved: bool,
+    plate_followup: Option<(Instant, (f32, f32), bool)>,
     pending_ups: Vec<(Instant, Event)>,
     ctx_key_taps: Vec<(usize, sdl2::keyboard::Keycode)>,
     ctx_confirm_keys: Vec<sdl2::keyboard::Keycode>,
+    ctx_back_keys: Vec<sdl2::keyboard::Keycode>,
     stick_active: bool,
     _sensor_ctx: sdl2::SensorSubsystem,
     accelerometer: Option<sdl2::sensor::Sensor>,
@@ -326,6 +342,10 @@ impl Window {
         // Local: let a window keep reading its controller while unfocused,
         // so two linked instances can each have their own controller.
         sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+
+        // Local: a click on an unfocused window should also reach the app,
+        // not just focus the window (two windows are used side by side).
+        sdl2::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
 
         // Local: keyboard-to-touch mapping.
         let mut key_map = Vec::new();
@@ -388,6 +408,11 @@ impl Window {
         }
         let ctx_confirm_keys: Vec<_> = options
             .menu_confirm_keys
+            .iter()
+            .filter_map(|n| sdl2::keyboard::Keycode::from_name(n))
+            .collect();
+        let ctx_back_keys: Vec<_> = options
+            .menu_back_keys
             .iter()
             .filter_map(|n| sdl2::keyboard::Keycode::from_name(n))
             .collect();
@@ -507,9 +532,16 @@ impl Window {
             ctx_swallowed: std::collections::HashSet::new(),
             menu_sel: None,
             menu_pointer: None,
+            menu_ctx_active: false,
+            plates: Vec::new(),
+            plates_seen: Vec::new(),
+            plate_sel: None,
+            plate_user_moved: false,
+            plate_followup: None,
             pending_ups: Vec::new(),
             ctx_key_taps,
             ctx_confirm_keys,
+            ctx_back_keys,
             _sensor_ctx: sensor_ctx,
             accelerometer,
             virtual_cursor_last: None,
@@ -631,6 +663,22 @@ impl Window {
                 }
             }
         }
+        // Local: second tap for buttons that only highlighted on the first.
+        if let Some((due, at, was_highlighted)) = self.plate_followup {
+            if Instant::now() >= due {
+                self.plate_followup = None;
+                let still_waiting = self
+                    .plates
+                    .iter()
+                    .find(|p| (p.cx - at.0).hypot(p.cy - at.1) < 3.0)
+                    .is_some_and(|p| p.flags & 0x100 != 0 && p.flags & 0x2000 == 0);
+                if !was_highlighted && still_waiting {
+                    let evs = self.tap_events(at);
+                    self.event_queue.extend(evs);
+                }
+            }
+        }
+
         // Local: delayed releases for screen-menu taps.
         let now = Instant::now();
         let mut i = 0;
@@ -1100,8 +1148,14 @@ impl Window {
         if values != self.context {
             log!("Context: {:x?}", values);
             self.context = values;
+            let was_menu = self.menu_ctx_active;
+            self.plate_user_moved = false;
+            self.plate_sel = None;
             self.menu_sel = None;
             self.menu_pointer = None;
+            self.menu_ctx_active = self.context.first().is_some_and(|ctx| {
+                options.context_menus.iter().any(|m| m.contexts.contains(ctx))
+            });
             if let Some(&ctx) = self.context.first() {
                 if let Some(m) = options
                     .context_menus
@@ -1112,8 +1166,9 @@ impl Window {
                     self.menu_pointer = Some(m.items[0]);
                 }
             }
-            // Release movement touches so nothing stays held across screens.
-            if self.dpad_state.active {
+            // Release movement touches when entering or leaving a menu screen,
+            // so nothing stays held there.
+            if was_menu != self.menu_ctx_active && self.dpad_state.active {
                 self.dpad_state = DpadState {
                     left: false,
                     right: false,
@@ -1124,7 +1179,7 @@ impl Window {
                 self.event_queue
                     .push_back(Event::TouchesUp(HashMap::from([(FingerId::DpadToTouch, (0.0, 0.0))])));
             }
-            if self.stick_active {
+            if was_menu != self.menu_ctx_active && self.stick_active {
                 self.stick_active = false;
                 self.event_queue
                     .push_back(Event::TouchesUp(HashMap::from([(FingerId::StickToTouch, (0.0, 0.0))])));
@@ -1132,11 +1187,93 @@ impl Window {
         }
     }
 
+    /// Local: is d-pad navigation between the app's on-screen buttons active?
+    fn plate_nav_active(&self, options: &Options) -> bool {
+        let Some(&ctx) = self.context.first() else {
+            return false;
+        };
+        options.touch_plates
+            && !self.plates.is_empty()
+            && !options.plate_nav_exclude.contains(&ctx)
+            && !options.context_menus.iter().any(|m| m.contexts.contains(&ctx))
+    }
+
+    /// Local: update the app's current on-screen buttons. The app rebuilds
+    /// the list during each frame, so the fullest list from the last 150ms
+    /// is used.
+    pub fn set_plates(&mut self, plates: Vec<Plate>, options: &Options) {
+        let now = Instant::now();
+        self.plates_seen
+            .retain(|(t, _)| now.duration_since(*t) < Duration::from_millis(150));
+        self.plates_seen.push((now, plates));
+        let best = self
+            .plates_seen
+            .iter()
+            .max_by_key(|(t, p)| (p.len(), *t))
+            .map(|(_, p)| p.clone())
+            .unwrap_or_default();
+        self.plates = best;
+        if self.plate_nav_active(options) {
+            if self.plate_user_moved
+                && self.plate_sel.and_then(|s| self.nearest_plate(s, 6.0)).is_none()
+            {
+                self.plate_user_moved = false;
+            }
+            let keep = if self.plate_user_moved { self.plate_sel } else { None };
+            let sel = keep
+                .and_then(|s| self.nearest_plate(s, 6.0))
+                .or_else(|| {
+                    self.plates
+                        .iter()
+                        .filter(|p| p.num >= 0)
+                        .min_by_key(|p| p.num)
+                        .or(self.plates.first())
+                        .map(|p| (p.cx, p.cy))
+                });
+            self.plate_sel = sel;
+            self.menu_pointer = sel;
+        } else if !self
+            .context
+            .first()
+            .is_some_and(|c| options.context_menus.iter().any(|m| m.pointer && m.contexts.contains(c)))
+        {
+            self.plate_sel = None;
+            self.menu_pointer = None;
+        }
+    }
+
+    fn nearest_plate(&self, (x, y): (f32, f32), max_dist: f32) -> Option<(f32, f32)> {
+        self.plates
+            .iter()
+            .map(|p| ((p.cx - x).hypot(p.cy - y), p))
+            .filter(|(d, _)| *d <= max_dist)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, p)| (p.cx, p.cy))
+    }
+
+    fn plate_in_direction(&self, (x, y): (f32, f32), (dx, dy): (f32, f32)) -> Option<(f32, f32)> {
+        self.plates
+            .iter()
+            .filter_map(|p| {
+                let (vx, vy) = (p.cx - x, p.cy - y);
+                let along = vx * dx + vy * dy;
+                let perp = (vx * dy - vy * dx).abs();
+                if along > 4.0 && perp <= along * 2.5 {
+                    Some((along + perp * 2.0, (p.cx, p.cy)))
+                } else {
+                    None
+                }
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, c)| c)
+    }
+
     fn in_menu_context(&self, options: &Options) -> bool {
         let Some(&ctx) = self.context.first() else {
             return false;
         };
         options.context_menus.iter().any(|m| m.contexts.contains(&ctx))
+            || self.plate_nav_active(options)
     }
 
     /// Local: screen-dependent handling of a button/key press or release.
@@ -1170,7 +1307,9 @@ impl Window {
         }
 
         // Screen with a list of choices.
-        let menu = options.context_menus.iter().find(|m| m.contexts.contains(&ctx))?;
+        let Some(menu) = options.context_menus.iter().find(|m| m.contexts.contains(&ctx)) else {
+            return self.plate_nav_input(options, input);
+        };
         let n = menu.items.len();
         let dir: Option<i32> = match input {
             CtxInput::Button(crate::options::Button::DPadUp | crate::options::Button::DPadLeft) => Some(-1),
@@ -1215,6 +1354,83 @@ impl Window {
             Event::TouchesUp(HashMap::from([(fid, coords)])),
         ));
         Some(vec![Event::TouchesDown(HashMap::from([(fid, coords)]))])
+    }
+
+    /// Local: d-pad navigation between the app's on-screen buttons.
+    fn plate_nav_input(&mut self, options: &Options, input: CtxInput) -> Option<Vec<Event>> {
+        if !self.plate_nav_active(options) {
+            return None;
+        }
+        use crate::options::Button as B;
+        let dir: Option<(f32, f32)> = match input {
+            CtxInput::Button(B::DPadUp) => Some((0.0, -1.0)),
+            CtxInput::Button(B::DPadDown) => Some((0.0, 1.0)),
+            CtxInput::Button(B::DPadLeft) => Some((-1.0, 0.0)),
+            CtxInput::Button(B::DPadRight) => Some((1.0, 0.0)),
+            CtxInput::Key(k) => match self.key_map.iter().find(|(mk, _)| *mk == k).map(|x| x.1) {
+                Some(KeyAction::DpadUp) => Some((0.0, -1.0)),
+                Some(KeyAction::DpadDown) => Some((0.0, 1.0)),
+                Some(KeyAction::DpadLeft) => Some((-1.0, 0.0)),
+                Some(KeyAction::DpadRight) => Some((1.0, 0.0)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let confirm = match input {
+            CtxInput::Button(b) => options.menu_confirm_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_confirm_keys.contains(&k),
+        };
+        let back = match input {
+            CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
+        };
+        if back && !confirm && dir.is_none() {
+            self.ctx_swallowed.insert(input);
+            // The back arrow sits in the top-right corner of menu screens.
+            let target = self
+                .plates
+                .iter()
+                .filter(|p| (p.cx - 448.0).hypot(p.cy - 20.0) < 25.0)
+                .map(|p| (p.cx, p.cy))
+                .next();
+            return Some(target.map(|t| self.tap_events(t)).unwrap_or_default());
+        }
+        let is_mouse_free_input = dir.is_some() || confirm;
+        if !is_mouse_free_input {
+            // Other mapped buttons are ignored on menu screens, so they don't
+            // tap random spots.
+            self.ctx_swallowed.insert(input);
+            return Some(Vec::new());
+        }
+        self.ctx_swallowed.insert(input);
+        let cur = self.plate_sel?;
+        if let Some(d) = dir {
+            if let Some(next) = self.plate_in_direction(cur, d) {
+                self.plate_sel = Some(next);
+                self.menu_pointer = Some(next);
+                self.plate_user_moved = true;
+            }
+            return Some(Vec::new());
+        }
+        // Confirm: tap the selected button. If the app only highlights it,
+        // a follow-up tap is sent shortly after (see poll_for_events).
+        let was_highlighted = self
+            .plates
+            .iter()
+            .find(|p| (p.cx - cur.0).hypot(p.cy - cur.1) < 3.0)
+            .is_some_and(|p| p.flags & 0x100 != 0);
+        self.plate_followup = Some((Instant::now() + Duration::from_millis(220), cur, was_highlighted));
+        Some(self.tap_events(cur))
+    }
+
+    fn tap_events(&mut self, (x, y): (f32, f32)) -> Vec<Event> {
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_000);
+        self.pending_ups.push((
+            Instant::now() + Duration::from_millis(90),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+        vec![Event::TouchesDown(HashMap::from([(fid, coords)]))]
     }
 
     /// Local: apply a keyboard-to-touch mapping (local or forwarded key).
