@@ -23,4 +23,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @end
 
+@implementation SKPayment: NSObject
++ (id)paymentWithProductIdentifier:(id)_ident { nil }
++ (id)paymentWithProduct:(id)_product { nil }
+@end
+
 };

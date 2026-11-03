@@ -115,7 +115,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)uniqueIdentifier {
     // Aspen Simulator returns (null) here
     // A device unique identifier must be 40 characters long
-    ns_string::get_static_str(env, "touchHLEdevice..........................")
+    match env.options.device_id.clone() {
+        Some(id) => {
+            let mut id: String = id.chars().take(40).collect();
+            while id.len() < 40 {
+                id.push('.');
+            }
+            ns_string::from_rust_string(env, id)
+        }
+        None => ns_string::get_static_str(env, "touchHLEdevice.........................."),
+    }
 }
 
 - (bool)isMultitaskingSupported {

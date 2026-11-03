@@ -417,9 +417,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     if view_tag == tag {
         return this;
     }
+    // Real UIKit searches all descendants (depth-first), not just direct
+    // children.
+    let subviews = subviews.clone();
     for view in subviews {
-        if env.objc.borrow::<UIViewHostObject>(*view).tag == tag {
-            return *view;
+        let found: id = msg![env; view viewWithTag:tag];
+        if found != nil {
+            return found;
         }
     }
     nil

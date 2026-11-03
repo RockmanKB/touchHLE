@@ -62,6 +62,8 @@ const C_STRING_FRIENDLY_ENCODINGS: &[NSStringEncoding] = &[
     NSWindowsCP1252StringEncoding,
     NSMacOSRomanStringEncoding,
     NSISOLatin1StringEncoding,
+    // Shift-JIS never uses a 0x00 byte inside a multi-byte sequence.
+    NSShiftJISStringEncoding,
 ];
 
 pub const NSMaximumStringLength: NSUInteger = (i32::MAX - 1) as _;

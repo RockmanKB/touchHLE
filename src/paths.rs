@@ -110,6 +110,17 @@ pub const WALLPAPER_FILES: &[&str] = &[
 /// the `Documents` directory.
 pub const SANDBOX_DIR: &str = "touchHLE_sandbox";
 
+/// Local: optional override of [SANDBOX_DIR] (`--sandbox=`), so two
+/// instances run from the same folder can keep separate save data.
+pub static SANDBOX_DIR_OVERRIDE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn sandbox_dir() -> &'static str {
+    SANDBOX_DIR_OVERRIDE
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or(SANDBOX_DIR)
+}
+
 /// Get a platform-specific base path needed for accessing touchHLE's
 /// user-modifiable files. This is empty on platforms other than Android.
 pub fn user_data_base_path() -> Cow<'static, Path> {

@@ -465,6 +465,9 @@ fn substitute_classes(
         || name.starts_with("AltAds")
         || name.starts_with("FB") // Facebook
         || name.starts_with("Flurry")
+        || name.starts_with("MGTwitter") // Matt Gemmell's Twitter engine
+        || name.starts_with("XAuthTwitter")
+        || name == "ExchangeCredentialsOperation" // XAuth helper (NSOperation)
         || name.starts_with("Mobclix")
         || name.starts_with("OpenFeint")
         || name.starts_with("Tapjoy"))

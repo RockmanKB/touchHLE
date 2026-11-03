@@ -29,6 +29,72 @@ pub enum Button {
     X,
     Y,
     LeftShoulder,
+    RightShoulder,
+    Back,
+    LeftStick,
+    RightStick,
+}
+
+/// Local: parse a controller button name as used by `--button-to-touch=`.
+pub fn parse_button_name(name: &str) -> Result<Button, String> {
+    Ok(match name {
+        "DPadLeft" => Button::DPadLeft,
+        "DPadUp" => Button::DPadUp,
+        "DPadRight" => Button::DPadRight,
+        "DPadDown" => Button::DPadDown,
+        "Start" => Button::Start,
+        "A" => Button::A,
+        "B" => Button::B,
+        "X" => Button::X,
+        "Y" => Button::Y,
+        "LeftShoulder" => Button::LeftShoulder,
+        "RightShoulder" => Button::RightShoulder,
+        "Back" => Button::Back,
+        "LeftStick" => Button::LeftStick,
+        "RightStick" => Button::RightStick,
+        _ => return Err(format!("Invalid button name {name:?}")),
+    })
+}
+
+/// Local: a screen-dependent tap (see `--context-button=`/`--context-key=`).
+#[derive(Clone, Debug)]
+pub struct ContextTap {
+    pub contexts: Vec<u32>,
+    pub button: Option<Button>,
+    pub key: Option<String>,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Local: a screen where directional input steps through choices.
+#[derive(Clone, Debug)]
+pub struct ContextMenu {
+    pub contexts: Vec<u32>,
+    pub items: Vec<(f32, f32)>,
+    /// If true, directional input only moves an on-screen pointer and the
+    /// confirm input taps; if false, each step taps (for menus that
+    /// highlight on the first tap and act on the second).
+    pub pointer: bool,
+}
+
+fn parse_contexts(s: &str) -> Result<Vec<u32>, String> {
+    s.split('|')
+        .map(|v| {
+            let v = v.trim();
+            match v.strip_prefix("0x") {
+                Some(h) => u32::from_str_radix(h, 16),
+                None => v.parse(),
+            }
+            .map_err(|_| format!("Invalid screen value {v:?}"))
+        })
+        .collect()
+}
+
+/// Local: GameKit peer-to-peer link between two touchHLE instances.
+#[derive(Clone, Debug)]
+pub enum GameKitLink {
+    Host(u16),
+    Join(SocketAddr),
 }
 
 /// Struct containing all user-configurable options.
@@ -62,6 +128,16 @@ pub struct Options {
     pub dumping_file: PathBuf,
     pub ignore_gl_errors: bool,
     pub zero_stack_after_guest_to_host_call: Option<u32>,
+    pub gamekit_link: Option<GameKitLink>,
+    pub controller_index: Option<u32>,
+    pub context_probe: Option<(u32, Vec<u32>)>,
+    pub context_taps: Vec<ContextTap>,
+    pub context_menus: Vec<ContextMenu>,
+    pub menu_confirm_buttons: Vec<Button>,
+    pub menu_confirm_keys: Vec<String>,
+    pub key_to_touch: Vec<(String, f32, f32)>,
+    pub keys_to_dpad: Option<[String; 4]>,
+    pub device_id: Option<String>,
 }
 
 impl Default for Options {
@@ -95,6 +171,16 @@ impl Default for Options {
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
             ignore_gl_errors: false,
             zero_stack_after_guest_to_host_call: None,
+            gamekit_link: None,
+            controller_index: None,
+            context_probe: None,
+            context_taps: Vec::new(),
+            context_menus: Vec::new(),
+            menu_confirm_buttons: Vec::new(),
+            menu_confirm_keys: Vec::new(),
+            key_to_touch: Vec::new(),
+            keys_to_dpad: None,
+            device_id: None,
         }
     }
 }
@@ -112,6 +198,132 @@ impl Options {
                 return Err(format!("Value for {name} is out of range"));
             }
             Ok(arg)
+        }
+
+        if let Some(value) = arg.strip_prefix("--gamekit-host=") {
+            let port: u16 = value
+                .parse()
+                .map_err(|_| "--gamekit-host= requires a port number".to_string())?;
+            self.gamekit_link = Some(GameKitLink::Host(port));
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--gamekit-join=") {
+            use std::net::ToSocketAddrs;
+            let addr = value
+                .to_socket_addrs()
+                .map_err(|_| "--gamekit-join= requires ADDRESS:PORT".to_string())?
+                .next()
+                .ok_or_else(|| "--gamekit-join= requires ADDRESS:PORT".to_string())?;
+            self.gamekit_link = Some(GameKitLink::Join(addr));
+            if self.device_id.is_none() {
+                self.device_id = Some("touchHLEdevice2".to_string());
+            }
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--controller=") {
+            let n: u32 = value
+                .parse()
+                .ok()
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| "--controller= requires a number (1, 2, ...)".to_string())?;
+            self.controller_index = Some(n);
+            return Ok(true);
+        } else if let Some(values) = arg.strip_prefix("--key-to-touch=") {
+            // Key names may contain commas only at the start (e.g. ",") so
+            // split from the right.
+            let mut parts = values.rsplitn(3, ',');
+            let y = parts.next();
+            let x = parts.next();
+            let key = parts.next();
+            let (Some(key), Some(x), Some(y)) = (key, x, y) else {
+                return Err("--key-to-touch= requires KEY,X,Y".to_string());
+            };
+            let x: f32 = x.parse().map_err(|_| "--key-to-touch= X is invalid".to_string())?;
+            let y: f32 = y.parse().map_err(|_| "--key-to-touch= Y is invalid".to_string())?;
+            self.key_to_touch.push((key.to_string(), x, y));
+            return Ok(true);
+        } else if let Some(values) = arg.strip_prefix("--keys-to-dpad=") {
+            let parts: Vec<&str> = values.split(',').collect();
+            let [u, d, l, r] = parts[..] else {
+                return Err("--keys-to-dpad= requires UP,DOWN,LEFT,RIGHT".to_string());
+            };
+            self.keys_to_dpad = Some([u.into(), d.into(), l.into(), r.into()]);
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-probe=") {
+            fn num(s: &str) -> Result<u32, String> {
+                let s = s.trim();
+                if let Some(h) = s.strip_prefix("0x") {
+                    u32::from_str_radix(h, 16).map_err(|_| format!("bad number {s}"))
+                } else {
+                    s.parse().map_err(|_| format!("bad number {s}"))
+                }
+            }
+            let mut parts = value.split(',');
+            let ptr = num(parts.next().unwrap_or(""))?;
+            let offs = parts.map(num).collect::<Result<Vec<_>, _>>()?;
+            self.context_probe = Some((ptr, offs));
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-button=") {
+            let p: Vec<&str> = value.split(',').collect();
+            let [ctx, b, x, y] = p[..] else {
+                return Err("--context-button= requires SCREEN,BUTTON,X,Y".to_string());
+            };
+            self.context_taps.push(ContextTap {
+                contexts: parse_contexts(ctx)?,
+                button: Some(parse_button_name(b)?),
+                key: None,
+                x: x.parse().map_err(|_| "--context-button= X is invalid".to_string())?,
+                y: y.parse().map_err(|_| "--context-button= Y is invalid".to_string())?,
+            });
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-key=") {
+            let (ctx, rest) = value
+                .split_once(',')
+                .ok_or_else(|| "--context-key= requires SCREEN,KEY,X,Y".to_string())?;
+            let mut parts = rest.rsplitn(3, ',');
+            let (Some(y), Some(x), Some(key)) = (parts.next(), parts.next(), parts.next()) else {
+                return Err("--context-key= requires SCREEN,KEY,X,Y".to_string());
+            };
+            self.context_taps.push(ContextTap {
+                contexts: parse_contexts(ctx)?,
+                button: None,
+                key: Some(key.to_string()),
+                x: x.parse().map_err(|_| "--context-key= X is invalid".to_string())?,
+                y: y.parse().map_err(|_| "--context-key= Y is invalid".to_string())?,
+            });
+            return Ok(true);
+        } else if let Some((pointer, value)) = arg
+            .strip_prefix("--context-menu=")
+            .map(|v| (false, v))
+            .or_else(|| arg.strip_prefix("--context-pointer-menu=").map(|v| (true, v)))
+        {
+            let (ctx, rest) = value
+                .split_once(',')
+                .ok_or_else(|| "--context-menu= requires SCREEN,X1,Y1,...".to_string())?;
+            let nums = rest
+                .split(',')
+                .map(|n| n.trim().parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "--context-menu= coordinates are invalid".to_string())?;
+            if nums.is_empty() || nums.len() % 2 != 0 {
+                return Err("--context-menu= requires X,Y pairs".to_string());
+            }
+            self.context_menus.push(ContextMenu {
+                contexts: parse_contexts(ctx)?,
+                items: nums.chunks(2).map(|c| (c[0], c[1])).collect(),
+                pointer,
+            });
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--menu-confirm-button=") {
+            self.menu_confirm_buttons.push(parse_button_name(value)?);
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--menu-confirm-key=") {
+            self.menu_confirm_keys.push(value.to_string());
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--sandbox=") {
+            let _ = crate::paths::SANDBOX_DIR_OVERRIDE.set(value.to_string());
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--device-id=") {
+            self.device_id = Some(value.to_string());
+            return Ok(true);
         }
 
         if arg == "--fullscreen" {
@@ -160,6 +372,10 @@ impl Options {
                 "X" => Ok(Button::X),
                 "Y" => Ok(Button::Y),
                 "LeftShoulder" => Ok(Button::LeftShoulder),
+                "RightShoulder" => Ok(Button::RightShoulder),
+                "Back" => Ok(Button::Back),
+                "LeftStick" => Ok(Button::LeftStick),
+                "RightStick" => Ok(Button::RightStick),
                 _ => Err("Invalid button for --button-to-touch=".to_string()),
             }?;
             let x: f32 = x

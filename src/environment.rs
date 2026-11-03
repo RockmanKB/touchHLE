@@ -1426,6 +1426,23 @@ impl Environment {
                 // Polling for events can be quite expensive, so we shouldn't do
                 // this until after we've done some amount of work on the guest
                 // thread, lest every single callback call pay this cost.
+                if let Some((ptr, ref offs)) = self.options.context_probe {
+                    // Local: read the app's screen-state values for
+                    // context-dependent input mapping.
+                    let base: u32 = self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(ptr));
+                    let vals: Vec<u32> = if base >= 0x1000 {
+                        offs.iter()
+                            .map(|&o| {
+                                self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(base + o))
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(ref mut window) = self.window {
+                        window.set_context(vals, &self.options);
+                    }
+                }
                 if let Some(ref mut window) = self.window {
                     window.poll_for_events(&self.options);
                 }

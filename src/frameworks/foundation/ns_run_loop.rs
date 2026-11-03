@@ -440,6 +440,7 @@ pub fn run_run_loop(
 
         if is_main_run_loop {
             media_player::handle_players(env);
+            crate::frameworks::game_kit::handle_link(env);
         }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
