@@ -134,11 +134,23 @@ pub enum FingerId {
 }
 pub type Coords = (f32, f32);
 
+/// Local: outline drawn around the selected on-screen button, in window
+/// coordinates (x, y, w, h). Set when the frame's cursor is queried.
+/// Local (test-only): shared clock for latency measurements.
+pub static DEBUG_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+pub fn debug_ms() -> u128 {
+    DEBUG_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+pub static MENU_HIGHLIGHT: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+
 /// Local: an on-screen button reported by the app (see `--touch-plate-nav`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plate {
     pub cx: f32,
     pub cy: f32,
+    pub w: f32,
+    pub h: f32,
     pub flags: u32,
     pub num: i32,
 }
@@ -453,9 +465,16 @@ impl Window {
         } else {
             let (width, height) =
                 size_for_orientation(device_family, device_orientation, scale_hack);
+            // Local: --window-scale and a resizable window (the picture is
+            // letterboxed to whatever size the window has).
+            let (width, height) = (
+                (width as f32 * options.window_scale).round() as u32,
+                (height as f32 * options.window_scale).round() as u32,
+            );
             let window = video_ctx
                 .window(title, width, height)
                 .position_centered()
+                .resizable()
                 .opengl()
                 .build()
                 .unwrap();
@@ -1212,6 +1231,26 @@ impl Window {
             .max_by_key(|(t, p)| (p.len(), *t))
             .map(|(_, p)| p.clone())
             .unwrap_or_default();
+        let mut best = best;
+        if let Some(&ctx) = self.context.first() {
+            for (ctxs, items) in &options.extra_plates {
+                if ctxs.contains(&ctx) && !best.is_empty() {
+                    for (i, &[cx, cy, w, h]) in items.iter().enumerate() {
+                        best.push(Plate {
+                            cx,
+                            cy,
+                            w,
+                            h,
+                            flags: 0,
+                            num: 1000 + i as i32,
+                        });
+                    }
+                }
+            }
+        }
+        if std::env::var("TOUCHHLE_PLATE_DEBUG").is_ok() && best != self.plates {
+            log!("Plates ({:x?}): {:?}", self.context, best);
+        }
         self.plates = best;
         if self.plate_nav_active(options) {
             if self.plate_user_moved
@@ -1252,20 +1291,25 @@ impl Window {
     }
 
     fn plate_in_direction(&self, (x, y): (f32, f32), (dx, dy): (f32, f32)) -> Option<(f32, f32)> {
-        self.plates
-            .iter()
-            .filter_map(|p| {
-                let (vx, vy) = (p.cx - x, p.cy - y);
-                let along = vx * dx + vy * dy;
-                let perp = (vx * dy - vy * dx).abs();
-                if along > 4.0 && perp <= along * 2.5 {
-                    Some((along + perp * 2.0, (p.cx, p.cy)))
-                } else {
-                    None
-                }
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, c)| c)
+        // Prefer buttons roughly in line with the pressed direction; if there
+        // are none, take the best one anywhere on that side of the screen.
+        let pick = |cone: bool| {
+            self.plates
+                .iter()
+                .filter_map(|p| {
+                    let (vx, vy) = (p.cx - x, p.cy - y);
+                    let along = vx * dx + vy * dy;
+                    let perp = (vx * dy - vy * dx).abs();
+                    if along > 4.0 && (!cone || perp <= along * 1.5) {
+                        Some((along + perp * 4.0, (p.cx, p.cy)))
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, c)| c)
+        };
+        pick(true).or_else(|| pick(false))
     }
 
     fn in_menu_context(&self, options: &Options) -> bool {
@@ -1441,6 +1485,9 @@ impl Window {
         pressed: bool,
     ) -> Option<Event> {
         let action = self.key_map.iter().find(|(k, _)| *k == key)?.1;
+        if std::env::var("TOUCHHLE_LATENCY_DEBUG").is_ok() {
+            log!("LAT key {:?} pressed={} t={}", key, pressed, debug_ms());
+        }
         if pressed {
             if !self.keys_down.insert(key) {
                 return None;
@@ -1640,6 +1687,34 @@ impl Window {
     /// visible.
     pub fn virtual_cursor_visible_at(&self) -> Option<(f32, f32, bool)> {
         let real = self.virtual_cursor_last.filter(|c| c.3);
+        // Local: outline the button under the menu pointer, if known.
+        let (gw, gh) = size_for_orientation(
+            self.device_family,
+            self.device_orientation,
+            NonZeroU32::new(1).unwrap(),
+        );
+        let (vx, vy, vw, vh) = self.viewport();
+        let to_win = |x: f32, y: f32| -> (f32, f32) {
+            (
+                vx as f32 + x / gw as f32 * vw as f32,
+                vy as f32 + y / gh as f32 * vh as f32,
+            )
+        };
+        let rect = self.menu_pointer.and_then(|(px, py)| {
+            self.plates
+                .iter()
+                .filter(|p| (p.cx - px).abs() <= p.w / 2.0 + 1.0 && (p.cy - py).abs() <= p.h / 2.0 + 1.0)
+                .min_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+                .map(|p| {
+                    let (x0, y0) = to_win(p.cx - p.w / 2.0, p.cy - p.h / 2.0);
+                    let (x1, y1) = to_win(p.cx + p.w / 2.0, p.cy + p.h / 2.0);
+                    [x0, y0, x1 - x0, y1 - y0]
+                })
+        });
+        *MENU_HIGHLIGHT.lock().unwrap() = rect;
+        if real.is_none() && rect.is_some() {
+            return None;
+        }
         if real.is_none() {
             if let Some((gx, gy)) = self.menu_pointer {
                 // Local: show the screen-menu pointer (game coords -> window).
@@ -1951,7 +2026,14 @@ impl Window {
                 set_sdl2_orientation(new_orientation);
                 rotate_fullscreen_size(new_orientation, self.window.size())
             } else {
-                size_for_orientation(self.device_family, new_orientation, self.scale_hack)
+                let (w, h) =
+                    size_for_orientation(self.device_family, new_orientation, self.scale_hack);
+                // Local: keep the user's window scale when rotating.
+                let (cur_w, cur_h) = self.window.size();
+                let (old_w, old_h) =
+                    size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
+                let scale = (cur_w as f32 / old_w as f32).max(cur_h as f32 / old_h as f32).max(0.5);
+                ((w as f32 * scale).round() as u32, (h as f32 * scale).round() as u32)
             };
 
             // macOS quirk: when resizing the window, the new framebuffer's size
@@ -2028,9 +2110,8 @@ impl Window {
     pub fn viewport(&self) -> (u32, u32, u32, u32) {
         let (app_width, app_height) =
             size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
-        if !self.fullscreen && !Self::rotatable_fullscreen() {
-            return (0, 0, app_width, app_height);
-        }
+        // Local: windows can be scaled/resized, so always fit the picture to
+        // the window, letterboxed.
 
         let (screen_width, screen_height) = self.window.drawable_size();
 

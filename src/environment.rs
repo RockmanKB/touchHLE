@@ -516,6 +516,24 @@ impl Environment {
         let mut dyld = dyld::Dyld::new();
         dyld.do_initial_linking(&bins, &mut mem, &mut objc);
 
+        // Local: apply --patch-u32 patches to the loaded app, only where the
+        // expected original value is found.
+        for &(addr, expected, new) in &options.patches_u32 {
+            let ptr = mem::MutPtr::<u32>::from_bits(addr);
+            let found: u32 = mem.read(ptr);
+            if found == expected {
+                mem.write(ptr, new);
+                log!("Patched {:#x}: {:#x} -> {:#x}", addr, expected, new);
+            } else {
+                log!(
+                    "Warning: not patching {:#x}: expected {:#x}, found {:#x} (different app version?)",
+                    addr,
+                    expected,
+                    found
+                );
+            }
+        }
+
         let cpu = cpu::Cpu::new(match options.direct_memory_access {
             true => Some(&mut mem),
             false => None,
@@ -1448,6 +1466,20 @@ impl Environment {
                     if let Some(ref mut window) = self.window {
                         window.set_context(vals, &self.options);
                     }
+                    if base >= 0x1000 && std::env::var("TOUCHHLE_LATENCY_DEBUG").is_ok() {
+                        let r32 = |a: u32| -> u32 {
+                            self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(a))
+                        };
+                        let task = r32(base + 0x2550);
+                        if task >= 0x1000 {
+                            let now = (r32(base + 0x758), r32(task + 0x64) as i32);
+                            thread_local!(static LASTP: std::cell::Cell<(u32, i32)> = const { std::cell::Cell::new((0, 0)) });
+                            if LASTP.with(|l| l.get()) != now {
+                                LASTP.with(|l| l.set(now));
+                                log!("LAT frame={} x={} t={}", now.0, now.1, crate::window::debug_ms());
+                            }
+                        }
+                    }
                     // Local: read the app's on-screen buttons ("touch plates"):
                     // a per-frame list of up to 50 task pointers at +0x1774 with
                     // the count at +0x19d8 (Double Dragon's APPLET layout).
@@ -1479,6 +1511,8 @@ impl Environment {
                             plates.push(crate::window::Plate {
                                 cx,
                                 cy,
+                                w: w as f32,
+                                h: h as f32,
                                 flags: r32(t + 0x48),
                                 num: r32(t + 0x1c8) as i32,
                             });

@@ -35,6 +35,8 @@ pub struct State {
     listener: Option<TcpListener>,
     stream: Option<TcpStream>,
     rbuf: Vec<u8>,
+    /// Test-only artificial latency (TOUCHHLE_GK_DELAY_MS): frames wait here.
+    delayed: std::collections::VecDeque<(Instant, Vec<u8>)>,
     next_connect_attempt: Option<Instant>,
     picker: id,
     picker_delegate: id,
@@ -50,6 +52,7 @@ impl Default for State {
             listener: None,
             stream: None,
             rbuf: Vec::new(),
+            delayed: std::collections::VecDeque::new(),
             next_connect_attempt: None,
             picker: nil,
             picker_delegate: nil,
@@ -108,6 +111,7 @@ fn close_stream(env: &mut Environment) {
         let _ = s.shutdown(std::net::Shutdown::Both);
     }
     st.rbuf.clear();
+    st.delayed.clear();
 }
 
 /// Called from the main run loop each iteration.
@@ -179,10 +183,16 @@ pub fn handle_link(env: &mut Environment) {
         }
     }
 
-    // Dispatch complete frames (only once the app has a receive handler).
+    // Split complete frames off the stream, optionally delaying them.
+    let delay = Duration::from_millis(
+        std::env::var("TOUCHHLE_GK_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    );
     loop {
         let st = state(env);
-        if st.handler == nil || st.rbuf.len() < 4 {
+        if st.rbuf.len() < 4 {
             break;
         }
         let len = u32::from_le_bytes(st.rbuf[..4].try_into().unwrap()) as usize;
@@ -190,6 +200,20 @@ pub fn handle_link(env: &mut Environment) {
             break;
         }
         let frame: Vec<u8> = st.rbuf.drain(..4 + len).skip(4).collect();
+        st.delayed.push_back((Instant::now() + delay, frame));
+    }
+
+    // Dispatch due frames (only once the app has a receive handler).
+    loop {
+        let st = state(env);
+        if st.handler == nil {
+            break;
+        }
+        match st.delayed.front() {
+            Some((due, _)) if *due <= Instant::now() => {}
+            _ => break,
+        }
+        let frame = st.delayed.pop_front().unwrap().1;
         let (handler, session, context) = (st.handler, st.session, st.handler_context);
 
         let len32: NSUInteger = frame.len().try_into().unwrap();

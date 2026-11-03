@@ -83,6 +83,38 @@ pub unsafe fn present_frame(
     // clean this up so we don't need to worry about it in e.g. Core Animation
     gles.LoadIdentity();
 
+    // Local: outline around the selected menu button.
+    let highlight = *crate::window::MENU_HIGHLIGHT.lock().unwrap();
+    if let Some([rx, ry, rw, rh]) = highlight {
+        let (vx, vy, vw, vh) = viewport;
+        let (rx, ry) = (rx - vx as f32, ry - vy as f32);
+        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+        gles.Disable(gles11::TEXTURE_2D);
+        gles.Enable(gles11::BLEND);
+        gles.BlendFunc(gles11::ONE, gles11::ONE_MINUS_SRC_ALPHA);
+        let s = (vw as f32 / 480.0).min(vh as f32 / 480.0).max(1.0);
+        let mut bar = |x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 4]| {
+            let to_ndc = |x: f32, y: f32| [x / (vw as f32 / 2.0) - 1.0, 1.0 - y / (vh as f32 / 2.0)];
+            let [ax, ay] = to_ndc(x0, y0);
+            let [bx, by] = to_ndc(x1, y1);
+            let v: [f32; 12] = [ax, ay, ax, by, bx, ay, bx, ay, ax, by, bx, by];
+            gles.Color4f(c[0] * c[3], c[1] * c[3], c[2] * c[3], c[3]);
+            gles.VertexPointer(2, gles11::FLOAT, 0, v.as_ptr() as *const GLvoid);
+            gles.DrawArrays(gles11::TRIANGLES, 0, 6);
+        };
+        // dark outer edge, then gold frame
+        for (pad, t, c) in [
+            (3.0 * s, 5.0 * s, [0.0, 0.0, 0.0, 0.8]),
+            (2.0 * s, 3.0 * s, [0.98, 0.78, 0.25, 1.0]),
+        ] {
+            let (x0, y0, x1, y1) = (rx - pad, ry - pad, rx + rw + pad, ry + rh + pad);
+            bar(x0, y0, x1, y0 + t, c);
+            bar(x0, y1 - t, x1, y1, c);
+            bar(x0, y0, x0 + t, y1, c);
+            bar(x1 - t, y0, x1, y1, c);
+        }
+    }
+
     // Display virtual cursor
     if let Some((x, y, pressed)) = virtual_cursor_visible_at {
         let (vx, vy, vw, vh) = viewport;

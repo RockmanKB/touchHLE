@@ -136,6 +136,9 @@ pub struct Options {
     pub menu_confirm_buttons: Vec<Button>,
     pub menu_confirm_keys: Vec<String>,
     pub touch_plates: bool,
+    pub window_scale: f32,
+    pub patches_u32: Vec<(u32, u32, u32)>,
+    pub extra_plates: Vec<(Vec<u32>, Vec<[f32; 4]>)>,
     pub menu_back_buttons: Vec<Button>,
     pub menu_back_keys: Vec<String>,
     pub plate_nav_exclude: Vec<u32>,
@@ -183,6 +186,9 @@ impl Default for Options {
             menu_confirm_buttons: Vec::new(),
             menu_confirm_keys: Vec::new(),
             touch_plates: false,
+            window_scale: 1.0,
+            patches_u32: Vec::new(),
+            extra_plates: Vec::new(),
             menu_back_buttons: Vec::new(),
             menu_back_keys: Vec::new(),
             plate_nav_exclude: Vec::new(),
@@ -328,6 +334,46 @@ impl Options {
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--menu-back-key=") {
             self.menu_back_keys.push(value.to_string());
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-extra-buttons=") {
+            let (ctx, rest) = value
+                .split_once(',')
+                .ok_or_else(|| "--context-extra-buttons= requires SCREEN,X,Y,W,H,...".to_string())?;
+            let nums = rest
+                .split(',')
+                .map(|n| n.trim().parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "--context-extra-buttons= numbers are invalid".to_string())?;
+            if nums.is_empty() || nums.len() % 4 != 0 {
+                return Err("--context-extra-buttons= requires X,Y,W,H groups".to_string());
+            }
+            self.extra_plates.push((
+                parse_contexts(ctx)?,
+                nums.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
+            ));
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--patch-u32=") {
+            let n = |s: &str| -> Result<u32, String> {
+                let s = s.trim();
+                match s.strip_prefix("0x") {
+                    Some(h) => u32::from_str_radix(h, 16),
+                    None => s.parse(),
+                }
+                .map_err(|_| format!("--patch-u32=: bad number {s:?}"))
+            };
+            let p: Vec<&str> = value.split(',').collect();
+            let [a, e, v] = p[..] else {
+                return Err("--patch-u32= requires ADDRESS,EXPECTED,NEW".to_string());
+            };
+            self.patches_u32.push((n(a)?, n(e)?, n(v)?));
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--window-scale=") {
+            let v: f32 = value
+                .parse()
+                .ok()
+                .filter(|v: &f32| v.is_finite() && (0.5..=8.0).contains(v))
+                .ok_or_else(|| "--window-scale= requires a number from 0.5 to 8".to_string())?;
+            self.window_scale = v;
             return Ok(true);
         } else if arg == "--touch-plate-nav" {
             self.touch_plates = true;
