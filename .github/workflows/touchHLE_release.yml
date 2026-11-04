@@ -32,6 +32,21 @@ jobs:
     - name: Create bundle
       shell: bash
       run: cd dev-scripts && ./make-windows-bundle.sh ../target/release/touchHLE.exe && mv touchHLE_windows_bundle/ ..
+    - name: Build the Double Dragon app
+      run: cargo build --release --manifest-path dd_launcher/Cargo.toml
+    - name: Assemble the Double Dragon app folder
+      shell: bash
+      run: |
+        D="DoubleDragon_App/Double Dragon"
+        mkdir -p "$D/engine" "$D/game" "$D/config" "$D/saves/player1" "$D/saves/player2"
+        cp dd_launcher/target/release/DoubleDragon.exe "$D/Double Dragon.exe"
+        cp -r touchHLE_windows_bundle/* "$D/engine/"
+        printf 'Put DoubleDragon.ipa in this folder.\r\n' > "$D/game/PUT DoubleDragon.ipa HERE.txt"
+        cp dd_launcher/README.txt "$D/README.txt"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: DoubleDragon_App
+        path: DoubleDragon_App/
     - uses: actions/upload-artifact@v4
       with:
         name: touchHLE_Windows_DoubleDragon
