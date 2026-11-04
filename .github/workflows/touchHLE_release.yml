@@ -17,6 +17,9 @@ jobs:
       with:
         submodules: recursive
         fetch-depth: 0
+    - name: Unpack Double Dragon files
+      shell: bash
+      run: if [ -f dd_patch.zip ]; then 7z x -y dd_patch.zip; fi
     - name: Download Boost
       run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
     - name: Extract Boost
