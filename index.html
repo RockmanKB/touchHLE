@@ -169,10 +169,23 @@ code { font-family: var(--font-mono); font-size: .92em; }
         <option value="24">1.6× (24/sec)</option>
         <option value="30">2× (30/sec)</option>
       </select></label>
+    <label for="dash" class="label" style="display:inline-flex;gap:8px;align-items:center" title="How quickly the second forward tap must follow the first for a dash.">Dash double-tap
+      <select id="dash">
+        <option value="16">Original (about 1 second)</option>
+        <option value="8">Relaxed (about 1/2 second)</option>
+        <option value="5">Short (about 1/3 second)</option>
+        <option value="3">Very short (about 1/5 second)</option>
+      </select></label>
     <label class="check" for="classic" title="Changes the game itself, for both players.">
       <input type="checkbox" id="classic"> <span class="label" style="margin:0">Classic combos</span></label>
     <label class="check" for="hidepad" title="Removes the on-screen pad and buttons from the game screen. Touch still works in the same spots.">
       <input type="checkbox" id="hidepad"> <span class="label" style="margin:0">Hide on-screen buttons</span></label>
+    <label for="borderkey" class="label" style="display:inline-flex;gap:8px;align-items:center" title="Press this key in a game window to show or hide its border and title bar.">Border on/off key
+      <select id="borderkey">
+        <option value="">None</option><option value="F9">F9</option><option value="F10">F10</option><option value="F11">F11</option>
+        <option value="Insert">Insert</option><option value="Home">Home</option><option value="End">End</option><option value="PageUp">Page Up</option><option value="PageDown">Page Down</option>
+      </select></label>
+    <label class="check" for="borderless"><input type="checkbox" id="borderless"> <span class="label" style="margin:0">Start without border</span></label>
     <span class="label">Controllers seen by this page</span>
     <div class="pads" id="pads"><span class="pad-chip">None yet. Press any button on a controller.</span></div>
   </div>
@@ -207,6 +220,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
       <button type="button" class="btn primary" id="play2">Play 2 players</button>
       <button type="button" class="btn" id="open-game">Open game folder</button>
       <button type="button" class="btn" id="open-saves">Open saves folder</button>
+      <button type="button" class="btn" id="open-log" title="touchHLE_log.txt is in this folder. It is replaced each time you play.">Open log folder</button>
       <span class="status" id="app-status" role="status"></span>
     </div>
     <p class="hint">Your settings are saved automatically. For two players, in each window go to <b>Mode Select → Double Dragon Mode → Matching Start</b>.</p>
@@ -469,6 +483,9 @@ code { font-family: var(--font-mono); font-size: .92em; }
     $("#speed").value = String(state.speed || 15);
     $("#classic").checked = !!state.classic;
     $("#hidepad").checked = !!state.hidePad;
+    $("#dash").value = String(state.dash || 16);
+    $("#borderkey").value = state.borderKey === undefined ? "F10" : state.borderKey;
+    $("#borderless").checked = !!state.borderless;
     const wrap = $("#players");
     wrap.innerHTML = [0, 1].slice(0, state.count).map(playerPanel).join("");
     // warnings
@@ -524,12 +541,24 @@ code { font-family: var(--font-mono); font-size: .92em; }
 
     // Options screen: a scrolling list. Rows are 50 apart; arrows scroll it.
     a.push(`--context-list-menu=${SCREENS.options},230,53,50,280,44,4,8,375,38,375,240,448,22`);
+    // ...and where the game keeps that list's scroll position, scroll limit and selected row.
+    a.push(`--context-list-state=${SCREENS.options},0x1a04,0x1a08,0x1a00`);
     // Classic combos: small changes to the game's own move code (same for both
     // players, so co-op windows stay in sync). Left/Right + D = headbutt (instead
     // of Up + D); Jump + Punch/Attack within 2 frames = back elbow (instead of
     // Down + D); Up/Down + D become a plain D.
     if (state.classic) a.push(...CLASSIC_PATCH);
     if (state.hidePad) a.push(...HIDE_PAD_PATCH);
+    // Dash: the game allows 16 frames between the two forward taps; these are
+    // the three places that compare against that limit.
+    const dash = Number(state.dash || 16);
+    if (dash !== 16) {
+      const h = dash.toString(16).padStart(2, "0");
+      a.push(`--patch-u32=0xb418,0x2910b2d9,0x29${h}b2d9`, `--patch-u32=0xb454,0xbf982b10,0xbf982b${h}`, `--patch-u32=0xb480,0x2b103171,0x2b${h}3171`);
+    }
+    const bk = state.borderKey === undefined ? "F10" : state.borderKey;
+    if (bk) a.push(`--border-toggle-key=${bk}`);
+    if (state.borderless) a.push("--borderless");
     // First-run Auto/Manual prompt: its two choices aren't in the game's button list.
     a.push(`--context-extra-buttons=${SCREENS.modePrompt},120,248,120,24,360,248,120,24`);
     for (const k of allKeys(pl, "d")) a.push(`--menu-back-key=${k}`);
@@ -674,6 +703,9 @@ code { font-family: var(--font-mono); font-size: .92em; }
     if (t.id === "speed") { state.speed = Number(t.value); render(); }
     if (t.id === "classic") { state.classic = t.checked; render(); }
     if (t.id === "hidepad") { state.hidePad = t.checked; render(); }
+    if (t.id === "dash") { state.dash = Number(t.value); render(); }
+    if (t.id === "borderkey") { state.borderKey = t.value; render(); }
+    if (t.id === "borderless") { state.borderless = t.checked; render(); }
     if (t.matches('select[data-role="size"]')) { state.players[Number(t.dataset.p)].size = t.value; render(); }
     if (t.matches("input[data-opt]")) { state.players[Number(t.dataset.p)][t.dataset.opt] = t.checked; render(); }
   });
@@ -789,6 +821,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
     $("#play2").addEventListener("click", () => go(2));
     $("#open-game").addEventListener("click", () => toApp({ type: "open", folder: "game" }));
     $("#open-saves").addEventListener("click", () => toApp({ type: "open", folder: "saves" }));
+    $("#open-log").addEventListener("click", () => toApp({ type: "open", folder: "engine" }));
   }
 
   render();
