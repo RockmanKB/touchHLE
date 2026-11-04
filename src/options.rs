@@ -33,6 +33,9 @@ pub enum Button {
     Back,
     LeftStick,
     RightStick,
+    /// Local: analog triggers (LT/L2, RT/R2), used as buttons.
+    LeftTrigger,
+    RightTrigger,
 }
 
 /// Local: parse a controller button name as used by `--button-to-touch=`.
@@ -52,6 +55,8 @@ pub fn parse_button_name(name: &str) -> Result<Button, String> {
         "Back" => Button::Back,
         "LeftStick" => Button::LeftStick,
         "RightStick" => Button::RightStick,
+        "LeftTrigger" => Button::LeftTrigger,
+        "RightTrigger" => Button::RightTrigger,
         _ => return Err(format!("Invalid button name {name:?}")),
     })
 }
@@ -162,6 +167,10 @@ pub struct Options {
     pub touch_plates: bool,
     pub window_scale: f32,
     pub stall_dumps: Vec<(u32, u32, u32, u32)>,
+    /// Local: key that shows/hides the window's border and title bar.
+    pub border_toggle_key: Option<String>,
+    /// Local: start without the window border.
+    pub borderless: bool,
     pub patches_u32: Vec<(u32, u32, u32)>,
     pub extra_plates: Vec<(Vec<u32>, Vec<[f32; 4]>)>,
     pub menu_back_buttons: Vec<Button>,
@@ -216,6 +225,8 @@ impl Default for Options {
             touch_plates: false,
             window_scale: 1.0,
             stall_dumps: Vec::new(),
+            border_toggle_key: None,
+            borderless: false,
             patches_u32: Vec::new(),
             extra_plates: Vec::new(),
             menu_back_buttons: Vec::new(),
@@ -487,7 +498,11 @@ impl Options {
             return Ok(true);
         }
 
-        if arg == "--fullscreen" {
+        if let Some(v) = arg.strip_prefix("--border-toggle-key=") {
+            self.border_toggle_key = Some(v.to_string());
+        } else if arg == "--borderless" {
+            self.borderless = true;
+        } else if arg == "--fullscreen" {
             self.fullscreen = true;
         } else if arg == "--upside-down" {
             self.initial_orientation = DeviceOrientation::PortraitUpsideDown;
@@ -537,6 +552,8 @@ impl Options {
                 "Back" => Ok(Button::Back),
                 "LeftStick" => Ok(Button::LeftStick),
                 "RightStick" => Ok(Button::RightStick),
+                "LeftTrigger" => Ok(Button::LeftTrigger),
+                "RightTrigger" => Ok(Button::RightTrigger),
                 _ => Err("Invalid button for --button-to-touch=".to_string()),
             }?;
             let x: f32 = x

@@ -1,0 +1,21 @@
+[package]
+name = "dd_launcher"
+version = "1.0.0"
+edition = "2021"
+description = "Double Dragon launcher for touchHLE (local, personal use)"
+
+# Not part of touchHLE's workspace.
+[workspace]
+
+[[bin]]
+name = "DoubleDragon"
+path = "src/main.rs"
+
+[dependencies]
+tao = "0.30.8"
+wry = "0.47.2"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

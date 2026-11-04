@@ -302,6 +302,8 @@ pub struct Window {
     _sdl_ctx: sdl2::Sdl,
     video_ctx: sdl2::VideoSubsystem,
     window: sdl2::video::Window,
+    /// Local: is the window border hidden?
+    borderless: bool,
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
@@ -339,6 +341,8 @@ pub struct Window {
     list_menu: Option<crate::options::ListMenu>,
     list_busy_until: Option<Instant>,
     combo: ComboState,
+    /// Local: analog triggers currently counted as pressed (left, right).
+    triggers_down: [bool; 2],
     plates: Vec<Plate>,
     plates_seen: Vec<(Instant, Vec<Plate>)>,
     plate_sel: Option<(f32, f32)>,
@@ -563,10 +567,14 @@ impl Window {
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
 
+        if options.borderless {
+            window.set_bordered(false);
+        }
         let mut window = Window {
             _sdl_ctx: sdl_ctx,
             video_ctx,
             window,
+            borderless: options.borderless,
             event_pump,
             event_queue: VecDeque::new(),
             last_polled: Instant::now() - Duration::from_secs(1),
@@ -606,6 +614,7 @@ impl Window {
             list_menu: None,
             list_busy_until: None,
             combo: ComboState::default(),
+            triggers_down: [false; 2],
             plates: Vec::new(),
             plates_seen: Vec::new(),
             plate_sel: None,
@@ -848,6 +857,14 @@ impl Window {
                     ..
                 } => {
                     let pressed = matches!(event, E::KeyDown { .. });
+                    // Local: border toggle key (this window only).
+                    if options.border_toggle_key.as_deref() == Some(k.name().as_str()) {
+                        if pressed {
+                            self.borderless = !self.borderless;
+                            self.window.set_bordered(!self.borderless);
+                        }
+                        continue;
+                    }
                     if let Some(link) = &self.key_link {
                         if let Some(peer) = link.peer {
                             let msg = format!("{}:{}", if pressed { "D" } else { "U" }, k.name());
@@ -879,6 +896,39 @@ impl Window {
                             continue;
                         }
                     }
+                }
+                E::ControllerAxisMotion {
+                    axis: axis @ (sdl2::controller::Axis::TriggerLeft | sdl2::controller::Axis::TriggerRight),
+                    value,
+                    ..
+                } => {
+                    // Local: triggers act as buttons (press past half way).
+                    let (i, b) = if axis == sdl2::controller::Axis::TriggerLeft {
+                        (0, crate::options::Button::LeftTrigger)
+                    } else {
+                        (1, crate::options::Button::RightTrigger)
+                    };
+                    let was = self.triggers_down[i];
+                    let pressed = if was { value > 8000 } else { value > 16000 };
+                    if pressed == was {
+                        continue;
+                    }
+                    self.triggers_down[i] = pressed;
+                    controller_updated = true;
+                    if let Some(evs) = self.context_input(options, CtxInput::Button(b), pressed) {
+                        self.event_queue.extend(evs);
+                        continue;
+                    }
+                    if let Some(&(x, y)) = options.button_to_touch.get(&b) {
+                        let coords = transform_input_coords(self, (x, y), true);
+                        let m = HashMap::from([(FingerId::ButtonToTouch(b), coords)]);
+                        self.event_queue.push_back(if pressed {
+                            Event::TouchesDown(m)
+                        } else {
+                            Event::TouchesUp(m)
+                        });
+                    }
+                    continue;
                 }
                 E::ControllerAxisMotion {
                     axis: sdl2::controller::Axis::LeftX | sdl2::controller::Axis::LeftY,
@@ -1002,6 +1052,9 @@ impl Window {
                         }
                     } else {
                         let Some(&(x, y)) = options.button_to_touch.get(&button) else {
+                            if matches!(event, E::ControllerButtonDown { .. }) {
+                                log!("Controller button {:?} pressed, but nothing is bound to it.", button);
+                            }
                             continue;
                         };
                         match event {
@@ -1425,6 +1478,8 @@ impl Window {
                                 let dc = transform_input_coords_mapped(self, e[2], true);
                                 let t = now + Duration::from_millis(80);
                                 self.combo.pending.push((t, mk(0, FingerId::Combo(1), dc)));
+                                // A short D tap, however long the buttons are held.
+                                self.combo.pending.push((t + Duration::from_millis(100), mk(2, FingerId::Combo(1), dc)));
                                 self.combo.swallow_up.insert(f);
                                 self.combo.swallow_up.insert(bf);
                                 self.combo.hold = Some(ComboHold {
@@ -1434,7 +1489,7 @@ impl Window {
                                     synthetic: held.is_none(),
                                     button: (FingerId::Combo(1), dc),
                                     button_down_at: t,
-                                    triggers: vec![f, bf],
+                                    triggers: Vec::new(),
                                     released: false,
                                     lifted: false,
                                 });
@@ -1477,9 +1532,12 @@ impl Window {
                 i += 1;
             }
         }
+        // The direction is only changed for about two game frames (so
+        // holding the buttons doesn't keep walking that way), except that a
+        // plain D keeps movement lifted until D is released.
         let finished = self.combo.hold.as_ref().is_some_and(|h| {
-            h.released
-                && now >= h.button_down_at + Duration::from_millis(150)
+            (h.released || !h.lifted)
+                && now >= h.button_down_at + Duration::from_millis(140)
                 && !self.combo.pending.iter().any(|(_, e)| matches!(e, Event::TouchesUp(m) if m.contains_key(&h.button.0)))
         });
         if finished {
@@ -2186,13 +2244,8 @@ impl Window {
                 vy as f32 + y / gh as f32 * vh as f32,
             )
         };
-        let list_rect = self.list_state.and_then(|(_, sel, scroll, _)| {
-            let lm = self.list_menu.as_ref()?;
-            let cy = list_row_y(lm, sel, scroll);
-            let (x0, y0) = to_win(lm.x - lm.w / 2.0, cy - lm.h / 2.0);
-            let (x1, y1) = to_win(lm.x + lm.w / 2.0, cy + lm.h / 2.0);
-            Some([x0, y0, x1 - x0, y1 - y0])
-        });
+        // List menus light up their own selected row, so no outline there.
+        let list_rect: Option<[f32; 4]> = None;
         let rect = list_rect.or_else(|| self.menu_pointer.and_then(|(px, py)| {
             self.plates
                 .iter()
