@@ -77,6 +77,23 @@ pub struct ContextMenu {
     pub pointer: bool,
 }
 
+/// Local: a scrolling list of rows (e.g. a settings screen). The first tap
+/// on a row selects it; tapping the selected row changes its value.
+#[derive(Debug, Clone)]
+pub struct ListMenu {
+    pub contexts: Vec<u32>,
+    pub x: f32,
+    pub y0: f32,
+    pub step: f32,
+    pub w: f32,
+    pub h: f32,
+    pub visible: usize,
+    pub total: usize,
+    pub up: (f32, f32),
+    pub down: (f32, f32),
+    pub back: (f32, f32),
+}
+
 fn parse_contexts(s: &str) -> Result<Vec<u32>, String> {
     s.split('|')
         .map(|v| {
@@ -133,6 +150,13 @@ pub struct Options {
     pub context_probe: Option<(u32, Vec<u32>)>,
     pub context_taps: Vec<ContextTap>,
     pub context_menus: Vec<ContextMenu>,
+    pub list_menus: Vec<ListMenu>,
+    /// Local: classic combos. Left/right + the button at this spot becomes
+    /// up + that button.
+    pub classic_headbutt: Option<(f32, f32)>,
+    /// Local: classic combos. Pressing the buttons at the first two spots
+    /// together becomes down + the button at the third spot.
+    pub classic_elbow: Option<[(f32, f32); 3]>,
     pub menu_confirm_buttons: Vec<Button>,
     pub menu_confirm_keys: Vec<String>,
     pub touch_plates: bool,
@@ -184,6 +208,9 @@ impl Default for Options {
             context_probe: None,
             context_taps: Vec::new(),
             context_menus: Vec::new(),
+            list_menus: Vec::new(),
+            classic_headbutt: None,
+            classic_elbow: None,
             menu_confirm_buttons: Vec::new(),
             menu_confirm_keys: Vec::new(),
             touch_plates: false,
@@ -336,6 +363,55 @@ impl Options {
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--menu-back-key=") {
             self.menu_back_keys.push(value.to_string());
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--classic-headbutt=") {
+            let n = value
+                .split(',')
+                .map(|n| n.trim().parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "--classic-headbutt= requires X,Y".to_string())?;
+            if n.len() != 2 {
+                return Err("--classic-headbutt= requires X,Y".to_string());
+            }
+            self.classic_headbutt = Some((n[0], n[1]));
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--classic-elbow=") {
+            let n = value
+                .split(',')
+                .map(|n| n.trim().parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "--classic-elbow= requires X1,Y1,X2,Y2,X3,Y3".to_string())?;
+            if n.len() != 6 {
+                return Err("--classic-elbow= requires X1,Y1,X2,Y2,X3,Y3".to_string());
+            }
+            self.classic_elbow = Some([(n[0], n[1]), (n[2], n[3]), (n[4], n[5])]);
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-list-menu=") {
+            // SCREEN,X,Y0,STEP,W,H,VISIBLE,TOTAL,UPX,UPY,DOWNX,DOWNY,BACKX,BACKY
+            let (ctx, rest) = value
+                .split_once(',')
+                .ok_or_else(|| "--context-list-menu= requires SCREEN,...".to_string())?;
+            let n = rest
+                .split(',')
+                .map(|n| n.trim().parse::<f32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "--context-list-menu= numbers are invalid".to_string())?;
+            if n.len() != 13 || n[5] < 1.0 || n[6] < 1.0 {
+                return Err("--context-list-menu= requires 13 numbers".to_string());
+            }
+            self.list_menus.push(ListMenu {
+                contexts: parse_contexts(ctx)?,
+                x: n[0],
+                y0: n[1],
+                step: n[2],
+                w: n[3],
+                h: n[4],
+                visible: n[5] as usize,
+                total: n[6] as usize,
+                up: (n[7], n[8]),
+                down: (n[9], n[10]),
+                back: (n[11], n[12]),
+            });
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--context-extra-buttons=") {
             let (ctx, rest) = value

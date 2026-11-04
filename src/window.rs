@@ -131,6 +131,8 @@ pub enum FingerId {
     DpadToTouch,
     KeyToTouch(u32),
     Context(u32),
+    /// Local: touches made up by the classic-combo filter.
+    Combo(u32),
 }
 pub type Coords = (f32, f32);
 
@@ -140,6 +142,13 @@ pub type Coords = (f32, f32);
 pub static DEBUG_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 pub fn debug_ms() -> u128 {
     DEBUG_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// Local: on-screen y of a list-menu row. Once scrolled, the list settles
+/// slightly lower than a whole number of rows.
+fn list_row_y(lm: &crate::options::ListMenu, sel: usize, scroll: usize) -> f32 {
+    let adjust = if scroll > 0 { 9.0 } else { 0.0 };
+    lm.y0 + (sel - scroll) as f32 * lm.step + adjust
 }
 
 pub static MENU_HIGHLIGHT: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
@@ -176,6 +185,39 @@ enum KeyAction {
 struct KeyLink {
     socket: std::net::UdpSocket,
     peer: Option<std::net::SocketAddr>,
+}
+
+/// Local: state of the classic-combo filter (see `combo_process`).
+#[derive(Default)]
+struct ComboState {
+    /// How many events at the front of the queue were already filtered.
+    filtered: usize,
+    /// Made-up events waiting for their time.
+    pending: Vec<(Instant, Event)>,
+    /// A jump/punch press held back briefly to see if the other follows.
+    buffered: Option<(FingerId, Coords, Instant)>,
+    /// Button releases to drop (their presses became a combo).
+    swallow_up: std::collections::HashSet<FingerId>,
+    /// The movement finger temporarily moved to another direction.
+    hold: Option<ComboHold>,
+}
+
+struct ComboHold {
+    finger: FingerId,
+    /// Where the player's real input is (None: released meanwhile).
+    real: Option<Coords>,
+    /// Where the finger was put.
+    forced: Coords,
+    /// The finger was made up (no movement was held).
+    synthetic: bool,
+    /// The button press the combo sends, and when it goes down.
+    button: (FingerId, Coords),
+    button_down_at: Instant,
+    /// Fingers whose release ends the combo; set once one is released.
+    triggers: Vec<FingerId>,
+    released: bool,
+    /// The finger was lifted (not moved) for the combo.
+    lifted: bool,
 }
 
 struct DpadState {
@@ -292,12 +334,18 @@ pub struct Window {
     menu_sel: Option<(u32, usize)>,
     menu_pointer: Option<(f32, f32)>,
     menu_ctx_active: bool,
+    /// Local: (screen, selected row, scroll, row tapped yet) for list menus.
+    list_state: Option<(u32, usize, usize, bool)>,
+    list_menu: Option<crate::options::ListMenu>,
+    list_busy_until: Option<Instant>,
+    combo: ComboState,
     plates: Vec<Plate>,
     plates_seen: Vec<(Instant, Vec<Plate>)>,
     plate_sel: Option<(f32, f32)>,
     plate_user_moved: bool,
     plate_nav_was_active: bool,
     move_touch_last: HashMap<FingerId, Coords>,
+    cursor_last_aim: Option<Instant>,
     plate_followup: Option<(Instant, (f32, f32), bool)>,
     pending_ups: Vec<(Instant, Event)>,
     ctx_key_taps: Vec<(usize, sdl2::keyboard::Keycode)>,
@@ -554,12 +602,17 @@ impl Window {
             menu_sel: None,
             menu_pointer: None,
             menu_ctx_active: false,
+            list_state: None,
+            list_menu: None,
+            list_busy_until: None,
+            combo: ComboState::default(),
             plates: Vec::new(),
             plates_seen: Vec::new(),
             plate_sel: None,
             plate_user_moved: false,
             plate_nav_was_active: false,
             move_touch_last: HashMap::new(),
+            cursor_last_aim: None,
             plate_followup: None,
             pending_ups: Vec::new(),
             ctx_key_taps,
@@ -599,6 +652,11 @@ impl Window {
     /// Since polling can be quite expensive, this function will skip it if it
     /// was called too recently.
     pub fn poll_for_events(&mut self, options: &Options) {
+        self.poll_for_events_inner(options);
+        self.combo_process(options);
+    }
+
+    fn poll_for_events_inner(&mut self, options: &Options) {
         assert!(self.on_main_stack);
         let now = Instant::now();
         // poll roughly twice per frame to try to avoid missing frames sometimes
@@ -1178,12 +1236,281 @@ impl Window {
         }
     }
 
+    /// Local: the game coordinates a button finger presses, if any.
+    fn finger_target(&self, options: &Options, f: FingerId) -> Option<(f32, f32)> {
+        match f {
+            FingerId::ButtonToTouch(b) => options.button_to_touch.get(&b).copied(),
+            FingerId::KeyToTouch(i) => self.key_map.iter().find_map(|(_, a)| match *a {
+                KeyAction::Touch(j, x, y) if j == i => Some((x, y)),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Local: game-coordinate rectangle of a movement finger's control.
+    fn move_rect(&self, options: &Options, f: FingerId) -> Option<(f32, f32, f32, f32)> {
+        match f {
+            FingerId::DpadToTouch => options.dpad_to_touch,
+            FingerId::StickToTouch => options.stick_to_touch,
+            _ => None,
+        }
+    }
+
+    /// Local: the held movement finger and its direction as (x, y) in -1..1
+    /// relative to its control (y negative = up).
+    fn held_direction(&self, options: &Options) -> Option<(FingerId, Coords, f32, f32)> {
+        for f in [FingerId::DpadToTouch, FingerId::StickToTouch] {
+            let Some(&p) = self.move_touch_last.get(&f) else {
+                continue;
+            };
+            let (x, y, w, h) = self.move_rect(options, f)?;
+            let c = transform_input_coords_mapped(self, (x + w / 2.0, y + h / 2.0), true);
+            let r = transform_input_coords_mapped(self, (x + w, y + h / 2.0), true);
+            let d = transform_input_coords_mapped(self, (x + w / 2.0, y + h), true);
+            let v = (p.0 - c.0, p.1 - c.1);
+            let ax = (r.0 - c.0, r.1 - c.1);
+            let ay = (d.0 - c.0, d.1 - c.1);
+            let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+            let dx = dot(v, ax) / dot(ax, ax).max(1e-6);
+            let dy = dot(v, ay) / dot(ay, ay).max(1e-6);
+            return Some((f, p, dx, dy));
+        }
+        None
+    }
+
+    /// Local: where to put a movement finger to point up (-1) or down (1).
+    fn vertical_point(&self, options: &Options, f: FingerId, dir: f32) -> Option<Coords> {
+        let (x, y, w, h) = self.move_rect(options, f).or(options.dpad_to_touch).or(options.stick_to_touch)?;
+        let gy = y + h / 2.0 + dir * h * 0.45;
+        Some(transform_input_coords_mapped(self, (x + w / 2.0, gy), true))
+    }
+
+    /// Local: classic-combo filter. Runs over events the poll just queued:
+    /// - left/right + D becomes up + D (headbutt in the older games);
+    /// - jump + punch together becomes down + D (back elbow).
+    fn combo_process(&mut self, options: &Options) {
+        let headbutt = options.classic_headbutt;
+        let elbow = options.classic_elbow;
+        if headbutt.is_none() && elbow.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1.0 && (a.1 - b.1).abs() < 1.0;
+
+        // Split new events into single-finger events and filter them.
+        let new: Vec<Event> = self.event_queue.drain(self.combo.filtered.min(self.event_queue.len())..).collect();
+        let mut out: Vec<Event> = Vec::new();
+        for ev in new {
+            let (kind, map) = match ev {
+                Event::TouchesDown(m) => (0, m),
+                Event::TouchesMove(m) => (1, m),
+                Event::TouchesUp(m) => (2, m),
+                other => {
+                    out.push(other);
+                    continue;
+                }
+            };
+            for (f, c) in map {
+                let mk = |k: u8, f: FingerId, c: Coords| {
+                    let m = HashMap::from([(f, c)]);
+                    match k {
+                        0 => Event::TouchesDown(m),
+                        1 => Event::TouchesMove(m),
+                        _ => Event::TouchesUp(m),
+                    }
+                };
+                // The movement finger is held in place during a combo.
+                if let Some(h) = &mut self.combo.hold {
+                    if h.finger == f && !matches!(f, FingerId::Combo(_)) {
+                        h.real = if kind == 2 { None } else { Some(c) };
+                        continue;
+                    }
+                    if h.synthetic && kind == 0 && matches!(f, FingerId::DpadToTouch | FingerId::StickToTouch) {
+                        // Real movement started while a made-up finger is
+                        // down: take it over.
+                        h.real = Some(c);
+                        h.finger = f;
+                        h.synthetic = false;
+                        out.push(mk(2, FingerId::Combo(0), h.forced));
+                        out.push(mk(0, f, h.forced));
+                        continue;
+                    }
+                    if h.triggers.contains(&f) && kind == 2 {
+                        if !h.released {
+                            h.released = true;
+                            let t = now.max(h.button_down_at + Duration::from_millis(100));
+                            let (bf, bc) = h.button;
+                            self.combo.pending.push((t, mk(2, bf, bc)));
+                        }
+                        self.combo.swallow_up.remove(&f);
+                        continue;
+                    }
+                }
+                if kind == 2 && self.combo.swallow_up.remove(&f) {
+                    continue;
+                }
+                let target = self.finger_target(options, f);
+                let role_d_head = headbutt.zip(target).is_some_and(|(a, t)| near(a, t));
+                let role_jump = elbow.zip(target).is_some_and(|(e, t)| near(e[0], t));
+                let role_punch = elbow.zip(target).is_some_and(|(e, t)| near(e[1], t));
+
+                if kind == 0 && role_d_head && self.combo.hold.is_none() {
+                    if let Some((mf, p, dx, dy)) = self.held_direction(options) {
+                        if dx.abs() <= 0.3 && dy.abs() > 0.3 {
+                            // Classic: up/down + D is a plain D. Lift the
+                            // movement finger while D is pressed.
+                            if std::env::var("TOUCHHLE_COMBO_DEBUG").is_ok() {
+                                log!("Combo: up/down+D -> D");
+                            }
+                            out.push(mk(2, mf, p));
+                            let t = now + Duration::from_millis(80);
+                            self.combo.pending.push((t, mk(0, f, c)));
+                            self.combo.hold = Some(ComboHold {
+                                finger: mf,
+                                real: Some(p),
+                                forced: p,
+                                synthetic: false,
+                                button: (f, c),
+                                button_down_at: t,
+                                triggers: vec![f],
+                                released: false,
+                                lifted: true,
+                            });
+                            continue;
+                        }
+                        if dx.abs() > 0.3 {
+                            if let Some(up) = self.vertical_point(options, mf, -1.0) {
+                                if std::env::var("TOUCHHLE_COMBO_DEBUG").is_ok() {
+                                    log!("Combo: side+D -> up+D");
+                                }
+                                out.push(mk(1, mf, up));
+                                let t = now + Duration::from_millis(80);
+                                self.combo.pending.push((t, mk(0, f, c)));
+                                self.combo.hold = Some(ComboHold {
+                                    finger: mf,
+                                    real: Some(p),
+                                    forced: up,
+                                    synthetic: false,
+                                    button: (f, c),
+                                    button_down_at: t,
+                                    triggers: vec![f],
+                                    released: false,
+                                    lifted: false,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if (role_jump || role_punch) && self.combo.hold.is_none() {
+                    if kind == 0 {
+                        let partner = self.combo.buffered.filter(|(bf, _, t)| {
+                            *bf != f && now.duration_since(*t) < Duration::from_millis(70)
+                        });
+                        if let (Some((bf, _, _)), Some(e)) = (partner, elbow) {
+                            // Jump + punch: down + D.
+                            if std::env::var("TOUCHHLE_COMBO_DEBUG").is_ok() {
+                                log!("Combo: jump+punch -> down+D");
+                            }
+                            self.combo.buffered = None;
+                            let held = self.held_direction(options);
+                            let mf = held.map(|h| h.0).unwrap_or(FingerId::Combo(0));
+                            if let Some(down) = self.vertical_point(options, mf, 1.0) {
+                                if held.is_some() {
+                                    out.push(mk(1, mf, down));
+                                } else {
+                                    out.push(mk(0, mf, down));
+                                }
+                                let dc = transform_input_coords_mapped(self, e[2], true);
+                                let t = now + Duration::from_millis(80);
+                                self.combo.pending.push((t, mk(0, FingerId::Combo(1), dc)));
+                                self.combo.swallow_up.insert(f);
+                                self.combo.swallow_up.insert(bf);
+                                self.combo.hold = Some(ComboHold {
+                                    finger: mf,
+                                    real: held.map(|h| h.1),
+                                    forced: down,
+                                    synthetic: held.is_none(),
+                                    button: (FingerId::Combo(1), dc),
+                                    button_down_at: t,
+                                    triggers: vec![f, bf],
+                                    released: false,
+                                    lifted: false,
+                                });
+                                continue;
+                            }
+                        }
+                        if let Some((bf, bc, _)) = self.combo.buffered.take() {
+                            out.push(mk(0, bf, bc));
+                        }
+                        self.combo.buffered = Some((f, c, now));
+                        continue;
+                    } else if kind == 2 {
+                        if let Some((bf, bc, _)) = self.combo.buffered {
+                            if bf == f {
+                                // Quick tap released while held back.
+                                self.combo.buffered = None;
+                                out.push(mk(0, bf, bc));
+                                self.combo.pending.push((now + Duration::from_millis(70), mk(2, f, c)));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                out.push(mk(kind, f, c));
+            }
+        }
+
+        // Timers.
+        if let Some((bf, bc, t)) = self.combo.buffered {
+            if now.duration_since(t) >= Duration::from_millis(60) {
+                self.combo.buffered = None;
+                out.push(Event::TouchesDown(HashMap::from([(bf, bc)])));
+            }
+        }
+        let mut i = 0;
+        while i < self.combo.pending.len() {
+            if self.combo.pending[i].0 <= now {
+                out.push(self.combo.pending.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        let finished = self.combo.hold.as_ref().is_some_and(|h| {
+            h.released
+                && now >= h.button_down_at + Duration::from_millis(150)
+                && !self.combo.pending.iter().any(|(_, e)| matches!(e, Event::TouchesUp(m) if m.contains_key(&h.button.0)))
+        });
+        if finished {
+            let h = self.combo.hold.take().unwrap();
+            if h.lifted {
+                if let Some(p) = h.real {
+                    out.push(Event::TouchesDown(HashMap::from([(h.finger, p)])));
+                }
+            } else {
+                out.push(match (h.synthetic, h.real) {
+                    (false, Some(p)) => Event::TouchesMove(HashMap::from([(h.finger, p)])),
+                    _ => Event::TouchesUp(HashMap::from([(h.finger, h.forced)])),
+                });
+            }
+        }
+        self.event_queue.extend(out);
+        self.combo.filtered = self.event_queue.len();
+    }
+
     /// Pop an event from the queue (in FIFO order, except for high priority
     /// events)
     pub fn pop_event(&mut self) -> Option<Event> {
         self.high_priority_event
             .take()
-            .or_else(|| self.event_queue.pop_front())
+            .or_else(|| {
+                let ev = self.event_queue.pop_front();
+                if ev.is_some() {
+                    self.combo.filtered = self.combo.filtered.saturating_sub(1);
+                }
+                ev
+            })
     }
 
     /// Local: update the app "context" (screen state) read from guest memory.
@@ -1198,6 +1525,17 @@ impl Window {
             self.menu_pointer = None;
             self.menu_ctx_active = self.context.first().is_some_and(|ctx| {
                 options.context_menus.iter().any(|m| m.contexts.contains(ctx))
+                    || options.list_menus.iter().any(|m| m.contexts.contains(ctx))
+            });
+            self.list_state = self.context.first().and_then(|&ctx| {
+                options
+                    .list_menus
+                    .iter()
+                    .any(|m| m.contexts.contains(&ctx))
+                    .then_some((ctx, 0, 0, false))
+            });
+            self.list_menu = self.context.first().and_then(|&ctx| {
+                options.list_menus.iter().find(|m| m.contexts.contains(&ctx)).cloned()
             });
             if let Some(&ctx) = self.context.first() {
                 if let Some(m) = options
@@ -1250,6 +1588,7 @@ impl Window {
             && !self.plates.is_empty()
             && !options.plate_nav_exclude.contains(&ctx)
             && !options.context_menus.iter().any(|m| m.contexts.contains(&ctx))
+            && !options.list_menus.iter().any(|m| m.contexts.contains(&ctx))
     }
 
     /// Local: update the app's current on-screen buttons. The app rebuilds
@@ -1390,6 +1729,11 @@ impl Window {
             return Some(vec![Event::TouchesDown(HashMap::from([(fid, coords)]))]);
         }
 
+        // Scrolling list of settings rows.
+        if let Some(lm) = options.list_menus.iter().find(|m| m.contexts.contains(&ctx)) {
+            return Some(self.list_menu_input(options, lm, ctx, input));
+        }
+
         // Screen with a list of choices.
         let Some(menu) = options.context_menus.iter().find(|m| m.contexts.contains(&ctx)) else {
             return self.plate_nav_input(options, input);
@@ -1505,6 +1849,108 @@ impl Window {
             .is_some_and(|p| p.flags & 0x100 != 0);
         self.plate_followup = Some((Instant::now() + Duration::from_millis(220), cur, was_highlighted));
         Some(self.tap_events(cur))
+    }
+
+    /// Local: d-pad input on a scrolling list menu.
+    fn list_menu_input(
+        &mut self,
+        options: &Options,
+        lm: &crate::options::ListMenu,
+        ctx: u32,
+        input: CtxInput,
+    ) -> Vec<Event> {
+        use crate::options::Button as B;
+        self.ctx_swallowed.insert(input);
+        let action = match input {
+            CtxInput::Key(k) => self.key_map.iter().find(|(mk, _)| *mk == k).map(|x| x.1),
+            _ => None,
+        };
+        let (up, down, side) = match input {
+            CtxInput::Button(b) => (b == B::DPadUp, b == B::DPadDown, matches!(b, B::DPadLeft | B::DPadRight)),
+            CtxInput::Key(_) => (
+                matches!(action, Some(KeyAction::DpadUp)),
+                matches!(action, Some(KeyAction::DpadDown)),
+                matches!(action, Some(KeyAction::DpadLeft | KeyAction::DpadRight)),
+            ),
+        };
+        let confirm = match input {
+            CtxInput::Button(b) => options.menu_confirm_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_confirm_keys.contains(&k),
+        };
+        let back = match input {
+            CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
+        };
+        let (_, mut sel, mut scroll, tapped) = match self.list_state {
+            Some(s) if s.0 == ctx => s,
+            _ => (ctx, 0, 0, false),
+        };
+        let row_pos = |sel: usize, scroll: usize| (lm.x, list_row_y(lm, sel, scroll));
+        let mut evs = Vec::new();
+        // Wait out the list's scrolling animation (a touch would stop it).
+        if self.list_busy_until.is_some_and(|t| Instant::now() < t) {
+            return evs;
+        }
+        if up || down {
+            let new_sel = if up { sel.saturating_sub(1) } else { (sel + 1).min(lm.total - 1) };
+            if new_sel == sel && tapped {
+                return evs;
+            }
+            sel = new_sel;
+            let mut delay = 0;
+            if sel < scroll {
+                scroll = sel;
+                evs = self.hold_events(lm.up, 250);
+                delay = 750;
+            } else if sel >= scroll + lm.visible {
+                scroll = sel + 1 - lm.visible;
+                evs = self.hold_events(lm.down, 250);
+                delay = 750;
+            }
+            if delay > 0 {
+                self.list_busy_until = Some(Instant::now() + Duration::from_millis(delay + 120));
+            }
+            self.tap_later(row_pos(sel, scroll), delay, &mut evs);
+            self.list_state = Some((ctx, sel, scroll, true));
+        } else if side || confirm {
+            // The first tap only selects the row; the next changes it.
+            self.tap_later(row_pos(sel, scroll), 0, &mut evs);
+            if !tapped {
+                self.tap_later(row_pos(sel, scroll), 250, &mut evs);
+            }
+            self.list_state = Some((ctx, sel, scroll, true));
+        } else if back {
+            evs = self.tap_events(lm.back);
+        }
+        evs
+    }
+
+    /// Local: tap at game coords after `delay_ms` (0 = now, into `evs`).
+    fn tap_later(&mut self, (x, y): (f32, f32), delay_ms: u64, evs: &mut Vec<Event>) {
+        if delay_ms == 0 {
+            evs.extend(self.tap_events((x, y)));
+            return;
+        }
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_001);
+        let t = Instant::now() + Duration::from_millis(delay_ms);
+        self.pending_ups
+            .push((t, Event::TouchesDown(HashMap::from([(fid, coords)]))));
+        self.pending_ups.push((
+            t + Duration::from_millis(90),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+    }
+
+    /// Local: press at game coords now and release after `hold_ms`.
+    fn hold_events(&mut self, (x, y): (f32, f32), hold_ms: u64) -> Vec<Event> {
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_002);
+        self.pending_ups.push((
+            Instant::now() + Duration::from_millis(hold_ms),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+        vec![Event::TouchesDown(HashMap::from([(fid, coords)]))]
     }
 
     fn tap_events(&mut self, (x, y): (f32, f32)) -> Vec<Event> {
@@ -1740,7 +2186,14 @@ impl Window {
                 vy as f32 + y / gh as f32 * vh as f32,
             )
         };
-        let rect = self.menu_pointer.and_then(|(px, py)| {
+        let list_rect = self.list_state.and_then(|(_, sel, scroll, _)| {
+            let lm = self.list_menu.as_ref()?;
+            let cy = list_row_y(lm, sel, scroll);
+            let (x0, y0) = to_win(lm.x - lm.w / 2.0, cy - lm.h / 2.0);
+            let (x1, y1) = to_win(lm.x + lm.w / 2.0, cy + lm.h / 2.0);
+            Some([x0, y0, x1 - x0, y1 - y0])
+        });
+        let rect = list_rect.or_else(|| self.menu_pointer.and_then(|(px, py)| {
             self.plates
                 .iter()
                 .filter(|p| (p.cx - px).abs() <= p.w / 2.0 + 1.0 && (p.cy - py).abs() <= p.h / 2.0 + 1.0)
@@ -1750,7 +2203,7 @@ impl Window {
                     let (x1, y1) = to_win(p.cx + p.w / 2.0, p.cy + p.h / 2.0);
                     [x0, y0, x1 - x0, y1 - y0]
                 })
-        });
+        }));
         *MENU_HIGHLIGHT.lock().unwrap() = rect;
         if real.is_none() && rect.is_some() {
             return None;
@@ -1792,6 +2245,20 @@ impl Window {
     fn update_virtual_cursor(&mut self, options: &Options) -> (f32, f32, bool, bool, bool) {
         // Get right analog stick input. The range is [-1, 1] on each axis.
         let (x, y, pressed) = self.get_controller_stick(options, false);
+
+        // Local: only let the tap button (RB / right-stick click) tap when the
+        // pointer is actually being used: the stick is tilted now or was in the
+        // last 2 seconds, or a tap is already in progress. Otherwise pressing
+        // RB would tap the middle of the screen.
+        let aiming = x != 0.0 || y != 0.0;
+        if aiming {
+            self.cursor_last_aim = Some(Instant::now());
+        }
+        let recently_aimed = self
+            .cursor_last_aim
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+        let already_pressed = self.virtual_cursor_last.is_some_and(|c| c.2);
+        let pressed = pressed && (aiming || recently_aimed || already_pressed);
 
         // The cursor is intended to only show up once you move the analog stick
         // out of its deadzone, or while the button is held.

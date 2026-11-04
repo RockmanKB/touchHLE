@@ -94,6 +94,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let mode: id = ns_string::get_static_str(env, NSDefaultRunLoopMode);
     let _: () = msg![env; run_loop addTimer:timer forMode:mode];
 
+    if std::env::var("TOUCHHLE_TIMER_DEBUG").is_ok() {
+        log!("Timer {:?} ({}) scheduled, interval {}", timer, selector.as_str(&env.mem), interval);
+    }
+
     timer
 }
 
@@ -124,6 +128,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())invalidate {
+    if std::env::var("TOUCHHLE_TIMER_DEBUG").is_ok() {
+        let sel = env.objc.borrow::<NSTimerHostObject>(this).selector;
+        log!("Timer {:?} ({}) invalidated", this, sel.as_str(&env.mem));
+    }
     let timer = env.objc.borrow_mut::<NSTimerHostObject>(this);
     // Timer might already be invalid, don't try to remove it twice.
     if timer.due_by.take().is_some() {

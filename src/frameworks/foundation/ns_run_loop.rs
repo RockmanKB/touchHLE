@@ -441,6 +441,17 @@ pub fn run_run_loop(
         if is_main_run_loop {
             media_player::handle_players(env);
             crate::frameworks::game_kit::handle_link(env);
+            // Local (test-only): TOUCHHLE_JANK=1 stalls 150ms every ~0.5s to
+            // simulate a slow device (frames arrive late, then bunch up).
+            if std::env::var("TOUCHHLE_JANK").is_ok() {
+                thread_local!(static LAST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) });
+                let now = Instant::now();
+                let due = LAST.with(|l| l.get()).is_none_or(|t| now.duration_since(t) > Duration::from_millis(500));
+                if due {
+                    LAST.with(|l| l.set(Some(now)));
+                    std::thread::sleep(Duration::from_millis(150));
+                }
+            }
         }
 
         // Unfortunately, touchHLE has to poll for certain things repeatedly;
