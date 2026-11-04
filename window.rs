@@ -2230,13 +2230,8 @@ impl Window {
                 vy as f32 + y / gh as f32 * vh as f32,
             )
         };
-        let list_rect = self.list_state.and_then(|(_, sel, scroll, _)| {
-            let lm = self.list_menu.as_ref()?;
-            let cy = list_row_y(lm, sel, scroll);
-            let (x0, y0) = to_win(lm.x - lm.w / 2.0, cy - lm.h / 2.0);
-            let (x1, y1) = to_win(lm.x + lm.w / 2.0, cy + lm.h / 2.0);
-            Some([x0, y0, x1 - x0, y1 - y0])
-        });
+        // List menus light up their own selected row, so no outline there.
+        let list_rect: Option<[f32; 4]> = None;
         let rect = list_rect.or_else(|| self.menu_pointer.and_then(|(px, py)| {
             self.plates
                 .iter()

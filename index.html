@@ -1,0 +1,796 @@
+<title>Double Dragon Controls</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Russo+One&family=Chakra+Petch:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: arcade control-panel. A header strip, then one "cabinet panel" per player
+   holding a schematic of the on-screen pad you click to bind, then the launcher output. */
+:root {
+  --bg: #0f1117;
+  --panel: #171a23;
+  --panel-2: #1f2330;
+  --line: #2e3445;
+  --fg: #e9e6dd;
+  --muted: #9a9fae;
+  --gold: #e8b64a;      /* title-logo gold */
+  --red: #d8432f;       /* dragon red, P1 */
+  --blue: #4b8fe0;      /* P2 */
+  --ok: #5fbf7a;
+  --warn: #e0a03a;
+  --font-display: "Russo One", "Arial Black", Impact, sans-serif;
+  --font-body: "Chakra Petch", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.5;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 24px 48px;
+}
+.wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 24px; }
+header { display: grid; gap: 6px; }
+h1 {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: clamp(28px, 5vw, 44px);
+  letter-spacing: .02em;
+  margin: 0;
+  color: var(--gold);
+  text-wrap: balance;
+}
+h1 span { color: var(--fg); }
+.lede { color: var(--muted); max-width: 68ch; margin: 0; }
+h2 {
+  font-family: var(--font-display); font-weight: 400; font-size: 20px;
+  margin: 0; letter-spacing: .02em;
+}
+.label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: var(--muted);
+  font-weight: 600;
+}
+.bar {
+  display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px;
+}
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button {
+  font: inherit; font-weight: 600; color: var(--muted); background: transparent;
+  border: 0; padding: 7px 14px; cursor: pointer;
+}
+.seg button[aria-pressed="true"] { background: var(--panel-2); color: var(--fg); box-shadow: inset 0 -2px 0 var(--gold); }
+.seg button:focus-visible, .btn:focus-visible, select:focus-visible, .slot:focus-visible, .hud-hit:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+select {
+  font: inherit; color: var(--fg); background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 10px;
+}
+.players { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 480px), 1fr)); gap: 20px; }
+.player {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 16px; display: grid; gap: 14px; min-width: 0;
+  border-top: 4px solid var(--pc);
+}
+.player[data-p="1"] { --pc: var(--red); }
+.player[data-p="2"] { --pc: var(--blue); }
+.player-head { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; }
+.tag {
+  font-family: var(--font-display); font-size: 13px; padding: 2px 9px; border-radius: 4px;
+  background: var(--pc); color: #fff; letter-spacing: .05em;
+}
+.controls-row { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; }
+.controls-row label { display: inline-flex; gap: 8px; align-items: center; }
+.hud { width: 100%; max-width: 100%; height: auto; display: block; border-radius: 8px; background: #11141b; border: 1px solid var(--line); }
+.hud text { font-family: var(--font-body); }
+.hud-hit { cursor: pointer; }
+.hud-hit circle, .hud-hit rect { transition: stroke .12s, fill .12s; }
+.hud-hit:hover circle, .hud-hit:hover rect, .hud-hit.active circle, .hud-hit.active rect { stroke: var(--gold); }
+.binds { width: 100%; border-collapse: collapse; font-size: 14px; }
+.binds th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .1em; padding: 6px 6px; border-bottom: 1px solid var(--line); }
+.binds td { padding: 6px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+.binds tr.active td { background: color-mix(in srgb, var(--gold) 10%, transparent); }
+.binds .what { font-weight: 600; white-space: nowrap; }
+.slot {
+  font: inherit; font-family: var(--font-mono); font-size: 13px;
+  min-width: 64px; padding: 4px 8px; border-radius: 6px; cursor: pointer;
+  background: var(--panel-2); color: var(--fg); border: 1px solid var(--line); text-align: left;
+}
+.slot.empty { color: var(--muted); }
+.slot.listening { border-color: var(--gold); color: var(--gold); animation: pulse 1s infinite; }
+.slot.dup { border-color: var(--warn); }
+@keyframes pulse { 50% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--gold) 25%, transparent); } }
+@media (prefers-reduced-motion: reduce) { .slot.listening { animation: none; } }
+.binds-cell { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.add {
+  font: inherit; font-weight: 700; width: 28px; height: 28px; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--muted); border: 1px dashed var(--line);
+}
+.add:hover { color: var(--gold); border-color: var(--gold); }
+.add:focus-visible { outline: 2px solid var(--gold); outline-offset: 2px; }
+.move-keys { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
+.move-keys .slot { min-width: 0; width: 100%; }
+.move-keys small { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }
+.check { display: inline-flex; gap: 6px; align-items: center; font-size: 14px; }
+.hint { color: var(--muted); font-size: 13px; margin: 0; }
+.notice {
+  border-radius: 8px; padding: 10px 12px; font-size: 14px;
+  background: var(--panel-2); border: 1px solid var(--line);
+}
+.notice.warn { border-color: var(--warn); }
+.notice.listen { border-color: var(--gold); }
+.pads { display: flex; flex-wrap: wrap; gap: 8px; }
+.pad-chip { font-size: 13px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2); }
+.pad-chip b { font-family: var(--font-mono); font-weight: 600; color: var(--gold); }
+.out { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: grid; gap: 14px; min-width: 0; }
+.steps { margin: 0; padding-left: 20px; display: grid; gap: 4px; max-width: 72ch; }
+pre {
+  margin: 0; background: #0b0d12; border: 1px solid var(--line); border-radius: 8px;
+  padding: 12px; overflow-x: auto; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55;
+  color: #d9d6cc; white-space: pre;
+}
+.actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.btn {
+  font: inherit; font-weight: 700; letter-spacing: .03em; cursor: pointer;
+  padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel-2); color: var(--fg);
+}
+.btn.primary { background: var(--gold); color: #1b1404; border-color: var(--gold); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.status { font-size: 14px; color: var(--muted); min-height: 1.5em; }
+.status.ok { color: var(--ok); }
+.status.err { color: var(--warn); }
+code { font-family: var(--font-mono); font-size: .92em; }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Double Dragon <span>Controls</span></h1>
+    <p class="lede">Bind your keyboard keys and controller buttons to the game's on-screen pad, for one or two players. When you're done, download the launcher. It starts the patched touchHLE with your bindings, and for two players it opens two linked windows.</p>
+  </header>
+
+  <div class="bar" role="group" aria-label="Setup">
+    <span class="label">Players</span>
+    <div class="seg" id="players-seg">
+      <button type="button" data-n="1" aria-pressed="false">1 player</button>
+      <button type="button" data-n="2" aria-pressed="true">2 players</button>
+    </div>
+    <label for="speed" class="label" style="display:inline-flex;gap:8px;align-items:center">Game speed
+      <select id="speed">
+        <option value="15">Original (15 updates/sec)</option>
+        <option value="15.75">1.05× (15.75/sec)</option>
+        <option value="16.5">1.1× (16.5/sec)</option>
+        <option value="18">1.2× (18/sec)</option>
+        <option value="20">1.33× (20/sec)</option>
+        <option value="24">1.6× (24/sec)</option>
+        <option value="30">2× (30/sec)</option>
+      </select></label>
+    <label class="check" for="classic" title="Changes the game itself, for both players.">
+      <input type="checkbox" id="classic"> <span class="label" style="margin:0">Classic combos</span></label>
+    <label class="check" for="hidepad" title="Removes the on-screen pad and buttons from the game screen. Touch still works in the same spots.">
+      <input type="checkbox" id="hidepad"> <span class="label" style="margin:0">Hide on-screen buttons</span></label>
+    <span class="label">Controllers seen by this page</span>
+    <div class="pads" id="pads"><span class="pad-chip">None yet. Press any button on a controller.</span></div>
+  </div>
+
+  <div id="listen-banner" class="notice listen" hidden></div>
+  <div id="warn-banner" class="notice warn" hidden></div>
+
+  <div class="players" id="players"></div>
+
+  <section class="out" aria-labelledby="screens-h">
+    <h2 id="screens-h">Menus and other screens</h2>
+    <p class="hint" style="font-size:14px">These follow from your bindings automatically. touchHLE watches which screen the game is on and changes what your buttons do.</p>
+    <table class="binds">
+      <thead><tr><th>Screen</th><th>What your controls do</th></tr></thead>
+      <tbody>
+        <tr><td class="what">Quitting to the menu</td><td>Includes a fix for the original game's freeze on "Now Loading" after quitting a stage.</td></tr>
+        <tr><td class="what">Game speed</td><td>Faster speeds make everything move and react sooner, like a turbo mode; the fight clock counts down faster too. Music and sound effects are not sped up. Both co-op windows always use the same speed.</td></tr>
+        <tr><td class="what">Classic combos</td><td>When ticked (top of the page), the game's own move rules change for both players: <b>Left/Right + D</b> does the headbutt and <b>Jump + Punch</b> (Auto mode: <b>Jump + Attack</b>) pressed together does the back elbow, like the older games. Up + D and Down + D become a plain D. Nothing is delayed or faked, so punches and jumps react exactly as normal.</td></tr>
+        <tr><td class="what">Fighting</td><td>Everything works as bound above. <b>Pause</b> opens the pause menu.</td></tr>
+        <tr><td class="what">Pause menu</td><td><b>Pause</b> resumes the game (in co-op, pausing stops both windows and each player presses Pause to resume). <b>Move</b> up/down highlights an item, and <b>Punch</b> (Auto mode: <b>Attack</b>) chooses it.</td></tr>
+        <tr><td class="what">Continue?</td><td><b>Move</b> up/down moves a dot between YES and NO, and <b>Pause</b> or <b>Punch</b> picks it.</td></tr>
+        <tr><td class="what">Title, menus, character select</td><td><b>Move</b> jumps a gold frame between the screen's buttons. <b>Pause</b>, <b>Punch</b> (Auto mode: <b>Attack</b>) or <b>Jump</b> picks the marked button, and <b>D</b> goes back. Screens without buttons, like the title, continue with Pause. The mouse works too.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="out" id="app-play" aria-labelledby="play-h" hidden>
+    <h2 id="play-h">Play</h2>
+    <p class="hint" id="ipa-line" style="font-size:14px"></p>
+    <div class="actions">
+      <button type="button" class="btn primary" id="play1">Play 1 player</button>
+      <button type="button" class="btn primary" id="play2">Play 2 players</button>
+      <button type="button" class="btn" id="open-game">Open game folder</button>
+      <button type="button" class="btn" id="open-saves">Open saves folder</button>
+      <span class="status" id="app-status" role="status"></span>
+    </div>
+    <p class="hint">Your settings are saved automatically. For two players, in each window go to <b>Mode Select → Double Dragon Mode → Matching Start</b>.</p>
+  </section>
+
+  <section class="out" id="bat-out" aria-labelledby="out-h">
+    <h2 id="out-h">Launcher</h2>
+    <p class="hint" style="font-size:14px">Using the <b>Double Dragon app</b> from your GitHub build? Everything here is built in there, with Play buttons, so you can skip this section.</p>
+    <ol class="steps">
+      <li>Put <code>touchHLE.exe</code> (your patched Windows build) and <code>DoubleDragon.ipa</code> in the same folder.</li>
+      <li>Unzip the launcher into that folder. It has <code>Play Double Dragon - 1 player.bat</code> for playing alone and, when 2 players is selected above, <code>Play Double Dragon - 2 players.bat</code> for co-op.</li>
+      <li>For two players, both windows open. In each window, go to <b>Mode Select → Double Dragon Mode → Matching Start</b>. They connect by themselves.</li>
+      <li>Windows can also be resized by dragging a corner. With two players on one screen, a big window for player 1 and the original size for player 2 works well; Full screen covers the other window (use Alt+Tab to reach it).</li>
+      <li>If you added a Double Dragon line to <code>touchHLE_options.txt</code> earlier, delete it, or both windows will pick up the same bindings.</li>
+    </ol>
+    <div class="actions">
+      <button type="button" class="btn primary" id="dl">Download launcher (.zip)</button>
+      <button type="button" class="btn" id="copy">Copy launcher text</button>
+      <span class="status" id="status" role="status"></span>
+    </div>
+    <pre id="bat" aria-label="Launcher script"></pre>
+  </section>
+</div>
+
+<script>
+(() => {
+  // ---- Game layout (coordinates are touchHLE's landscape 480x320 space) ----
+  const MOVE = { dpad: [31, 214, 80, 80], stick: [21, 204, 100, 100], cx: 71, cy: 254, r: 46 };
+  const LAYOUTS = {
+    manual: [
+      { id: "jump",   name: "Jump",   x: 385, y: 232, r: 21, color: "#8a5bb0" },
+      { id: "kick",   name: "Kick",   x: 447, y: 232, r: 24, color: "#3c97a3" },
+      { id: "punch",  name: "Punch",  x: 350, y: 285, r: 27, color: "#d06a2a" },
+      { id: "d",      name: "D (crouch / special)", short: "D", x: 417, y: 290, r: 21, color: "#8a5bb0" },
+      { id: "pause",  name: "Pause",  x: 239, y: 248, w: 64, h: 16 },
+      { id: "weapon", name: "Drop weapon", short: "Weapon", x: 240, y: 312, w: 84, h: 14 },
+    ],
+    auto: [
+      { id: "jump",   name: "Jump",   x: 398, y: 227, r: 22, color: "#8a5bb0" },
+      { id: "attack", name: "Attack", x: 350, y: 285, r: 27, color: "#d06a2a" },
+      { id: "d",      name: "D (crouch / special)", short: "D", x: 447, y: 290, r: 22, color: "#8a5bb0" },
+      { id: "pause",  name: "Pause",  x: 239, y: 248, w: 64, h: 16 },
+      { id: "weapon", name: "Drop weapon", short: "Weapon", x: 240, y: 312, w: 84, h: 14 },
+    ],
+  };
+
+  // ---- Screens (values of the game's current-screen routine, read by touchHLE) ----
+  const SCREENS = {
+    probe: "0xddec4,0x704,0x73c,0x740", // state slot, co-op flag, co-op state slot
+    pause: "0x2121d",                 // ST_PauseScreen
+    resume: [450, 20],                // back arrow, top right
+    pauseItems: [[240, 68], [240, 118], [240, 168], [240, 218]],
+    cont: "0x1ec49",                  // ST_ContinueScreen
+    gameplay: "0x21869",              // fighting (no menu navigation here)
+    loading: "0x1e049",               // ST_LoadListScreen ("Now Loading")
+    modePrompt: "0x1b1a5",            // ST_NotificationEX (first-run Auto/Manual choice)
+    contItems: [[240, 183], [240, 255]], // YES, NO
+    options: "0x1c3c5",               // Options screen (gear on the main menu)
+  };
+
+  // Hide the game's on-screen pad: its four drawing routines return at once.
+  const HIDE_PAD_PATCH = ["--patch-u32=0x28fcc,0xaf03b5f0,0xbf004770", "--patch-u32=0x27af4,0xaf02b5b0,0xbf004770", "--patch-u32=0x27b50,0xaf03b5f0,0xbf004770", "--patch-u32=0x27cc0,0xaf02b5b0,0xbf004770"];
+  const CLASSIC_PATCH = ["--patch-u32=0x2400,0x0,0x7f88f411", "--patch-u32=0x2404,0x0,0xf011d012", "--patch-u32=0x2408,0x0,0xd00f0f40", "--patch-u32=0x240c,0x0,0x46214630", "--patch-u32=0x2410,0x0,0xfba0f00a", "--patch-u32=0x2414,0x0,0x7200f643", "--patch-u32=0x2418,0x0,0x20df2c0", "--patch-u32=0x241c,0x0,0x23306812", "--patch-u32=0x2420,0x0,0x46214630", "--patch-u32=0x2424,0x0,0xfe16f00c", "--patch-u32=0x2428,0x0,0xbdf5f033", "--patch-u32=0x242c,0x0,0x880f011", "--patch-u32=0x2430,0x0,0x3179f894", "--patch-u32=0x2434,0x0,0xbdd4f033", "--patch-u32=0x2440,0x0,0x20d8f8d4", "--patch-u32=0x2444,0x0,0x7f88f412", "--patch-u32=0x2448,0x0,0xf894d02d", "--patch-u32=0x244c,0x0,0x3b01316c", "--patch-u32=0x2450,0x0,0x30ff003", "--patch-u32=0x2454,0x0,0x283eb04", "--patch-u32=0x2458,0x0,0x20e4f8d2", "--patch-u32=0x245c,0x0,0xf40f012", "--patch-u32=0x2460,0x0,0x3b01d111", "--patch-u32=0x2464,0x0,0x30ff003", "--patch-u32=0x2468,0x0,0x283eb04", "--patch-u32=0x246c,0x0,0x20e4f8d2", "--patch-u32=0x2470,0x0,0xf40f012", "--patch-u32=0x2474,0x0,0x6f22d017", "--patch-u32=0x2478,0x0,0x1ad26fa3", "--patch-u32=0x247c,0x0,0x1a9b6ea3", "--patch-u32=0x2480,0x0,0x141b66a3", "--patch-u32=0x2484,0x0,0x46286623", "--patch-u32=0x2488,0x0,0xf00a4621", "--patch-u32=0x248c,0x0,0xf643fb63", "--patch-u32=0x2490,0x0,0xf2c07200", "--patch-u32=0x2494,0x0,0x6812020d", "--patch-u32=0x2498,0x0,0x46282330", "--patch-u32=0x249c,0x0,0xf00c4621", "--patch-u32=0x24a0,0x0,0xf030fdd9", "--patch-u32=0x24a4,0x0,0x4628bf5b", "--patch-u32=0x24a8,0x0,0xf00f4621", "--patch-u32=0x24ac,0x0,0xbf00bb39", "--patch-u32=0x2500,0x0,0xf40f015", "--patch-u32=0x2504,0x0,0xf894d02d", "--patch-u32=0x2508,0x0,0x3b01316c", "--patch-u32=0x250c,0x0,0x30ff003", "--patch-u32=0x2510,0x0,0x283eb04", "--patch-u32=0x2514,0x0,0x20e4f8d2", "--patch-u32=0x2518,0x0,0x7f88f412", "--patch-u32=0x251c,0x0,0x3b01d109", "--patch-u32=0x2520,0x0,0x30ff003", "--patch-u32=0x2524,0x0,0x283eb04", "--patch-u32=0x2528,0x0,0x20e4f8d2", "--patch-u32=0x252c,0x0,0x7f88f412", "--patch-u32=0x2530,0x0,0x4630d017", "--patch-u32=0x2534,0x0,0xf00a4621", "--patch-u32=0x2538,0x0,0xf643fb0d", "--patch-u32=0x253c,0x0,0xf2c07200", "--patch-u32=0x2540,0x0,0x6812020d", "--patch-u32=0x2544,0x0,0x46302330", "--patch-u32=0x2548,0x0,0xf00c4621", "--patch-u32=0x254c,0x0,0x4630fd83", "--patch-u32=0x2550,0x0,0xf00a4621", "--patch-u32=0x2554,0x0,0x2000ffa5", "--patch-u32=0x2558,0x0,0xd14f1a7", "--patch-u32=0x255c,0x0,0x500e8bd", "--patch-u32=0x2560,0x0,0xf04fbdf0", "--patch-u32=0x2564,0x0,0xf00a0201", "--patch-u32=0x2568,0x0,0xbf00bde3", "--patch-u32=0x35fd8,0x880f011,0xba12f7cc", "--patch-u32=0x33320,0xf7de6463,0xf7cf6463", "--patch-u32=0x33324,0x4628fbfd,0x4628f88d", "--patch-u32=0x33388,0xf7d94606,0xf7cf4606", "--patch-u32=0x3338c,0x69a3fed1,0x69a3f8b9", "--patch-u32=0x35fe8,0xf01f015,0xf0af015", "--patch-u32=0x36000,0xd00a0a04,0xd00a0a00"];
+
+  // ---- Game speed: the game's frame interval (1/15 s) is stored as a double in
+  // three places; only the high word needs changing (low word is 0x11111111).
+  const SPEED_HI = { 15: null, 15.75: "0x3fb04104", 16.5: "0x3faf07c1", 18: "0x3fac71c7", 20: "0x3fa99999", 24: "0x3fa55555", 30: "0x3fa11111" };
+  const SPEED_ADDRS = ["0x7864", "0xc624", "0x1fa14"]; // viewDidLoad, StopBluetoothProcess, co-op pacing
+
+  // ---- Browser key code -> SDL key name (what touchHLE expects) ----
+  function sdlKeyName(code) {
+    if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+    if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+    if (/^Numpad[0-9]$/.test(code)) return "Keypad " + code.slice(6);
+    if (/^F([1-9]|1[01])$/.test(code)) return code;
+    const map = {
+      ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
+      Space: "Space", Enter: "Return", Tab: "Tab", Backspace: "Backspace",
+      ShiftLeft: "Left Shift", ShiftRight: "Right Shift", ControlLeft: "Left Ctrl", ControlRight: "Right Ctrl",
+      AltLeft: "Left Alt", AltRight: "Right Alt", CapsLock: "CapsLock",
+      Comma: ",", Period: ".", Slash: "/", Semicolon: ";", Quote: "'", BracketLeft: "[", BracketRight: "]",
+      Backslash: "\\", Minus: "-", Equal: "=", Backquote: "`",
+      NumpadEnter: "Keypad Enter", NumpadAdd: "Keypad +", NumpadSubtract: "Keypad -",
+      NumpadMultiply: "Keypad *", NumpadDivide: "Keypad /", NumpadDecimal: "Keypad .",
+      Insert: "Insert", Delete: "Delete", Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown",
+    };
+    return map[code] || null;
+  }
+
+  // ---- Standard gamepad button index -> touchHLE button name ----
+  const PAD_NAMES = { 0: "A", 1: "B", 2: "X", 3: "Y", 4: "LeftShoulder", 5: "RightShoulder", 6: "LeftTrigger", 7: "RightTrigger", 8: "Back", 9: "Start", 10: "LeftStick", 11: "RightStick" };
+  const PAD_LABEL = { A: "A", B: "B", X: "X", Y: "Y", LeftShoulder: "LB/L1", RightShoulder: "RB/R1", LeftTrigger: "LT/L2", RightTrigger: "RT/R2", Back: "Back", Start: "Start", LeftStick: "L-stick click", RightStick: "R-stick click" };
+
+  // ---- State ----
+  const DEFAULTS = () => ({
+    count: 2,
+    players: [
+      {
+        layout: "manual", controller: 1, padDpad: true, padStick: true,
+        moveKeys: ["W", "S", "A", "D"],
+        keys: { punch: "J", kick: "K", jump: "Space", d: "L", attack: "J", pause: "P", weapon: "Q" },
+        pad: { punch: "X", kick: "Y", jump: "A", d: "B", attack: "X", pause: "Start", weapon: "LeftShoulder" },
+      },
+      {
+        layout: "manual", controller: 2, padDpad: true, padStick: true,
+        moveKeys: ["Up", "Down", "Left", "Right"],
+        keys: { punch: "Keypad 1", kick: "Keypad 2", jump: "Keypad 0", d: "Keypad 3", attack: "Keypad 1", pause: "Keypad Enter", weapon: "Keypad 5" },
+        pad: { punch: "X", kick: "Y", jump: "A", d: "B", attack: "X", pause: "Start", weapon: "LeftShoulder" },
+      },
+    ],
+  });
+  // Inside the Double Dragon app (not a browser): settings live in its config folder.
+  const APP = window.DD_APP && window.ipc ? window.DD_APP : null;
+  const toApp = (m) => { try { window.ipc.postMessage(JSON.stringify(m)); } catch (e) {} };
+  let state = DEFAULTS();
+  if (APP && APP.config && APP.config.players && APP.config.players.length === 2) state = APP.config;
+  else try {
+    const saved = JSON.parse(localStorage.getItem("dd-controls-v1") || "null");
+    if (saved && saved.players && saved.players.length === 2) state = saved;
+  } catch (e) { /* storage unavailable: use defaults */ }
+  let saveTimer;
+  const save = () => {
+    if (APP) { clearTimeout(saveTimer); saveTimer = setTimeout(() => toApp({ type: "save", state }), 300); return; }
+    try { localStorage.setItem("dd-controls-v1", JSON.stringify(state)); } catch (e) {}
+  };
+
+  let listening = null; // {p, kind: "key"|"pad"|"move", id, dir}
+  let selected = null;  // {p, id} highlighted target
+
+  // ---- Rendering ----
+  const $ = (s, el = document) => el.querySelector(s);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  // Bindings: each action has a main key/button plus any number of extras.
+  const extraKey = (kind) => (kind === "pad" ? "xpad" : "xkeys");
+  const mainKey = (kind) => (kind === "pad" ? "pad" : "keys");
+  function getBind(pl, kind, id, idx) {
+    return idx ? ((pl[extraKey(kind)] || {})[id] || [])[idx - 1] : pl[mainKey(kind)][id];
+  }
+  function setBind(pl, kind, id, idx, val) {
+    if (idx) {
+      const all = (pl[extraKey(kind)] = pl[extraKey(kind)] || {});
+      const arr = (all[id] = all[id] || []);
+      if (val) arr[idx - 1] = val; else arr.splice(idx - 1, 1);
+    } else if (val) pl[mainKey(kind)][id] = val;
+    else delete pl[mainKey(kind)][id];
+  }
+  const allKeys = (pl, id) => [pl.keys[id], ...((pl.xkeys || {})[id] || [])].filter(Boolean);
+  const allPads = (pl, id) => (pl.controller ? [pl.pad[id], ...((pl.xpad || {})[id] || [])].filter(Boolean) : []);
+
+  function hudSvg(pi, pl) {
+    const items = LAYOUTS[pl.layout];
+    const label = (t) => {
+      return [...allKeys(pl, t.id).map((k) => k.replace("Keypad ", "Kp")), ...allPads(pl, t.id).map((b) => PAD_LABEL[b] || b)].join(" · ");
+    };
+    let s = `<svg class="hud" viewBox="0 190 480 130" role="group" aria-label="Player ${pi + 1} on-screen pad">`;
+    s += `<rect x="0" y="190" width="480" height="130" fill="#141821"/>`;
+    s += `<path d="M0 205 H150 L170 222 H310 L330 205 H480" stroke="#2a3040" stroke-width="2" fill="none"/>`;
+    // movement pad
+    const moveSel = selected && selected.p === pi && selected.id === "move";
+    const mk = pl.moveKeys.filter(Boolean).join(" ");
+    s += `<g class="hud-hit${moveSel ? " active" : ""}" data-p="${pi}" data-id="move" tabindex="0" role="button" aria-label="Movement pad">
+      <circle cx="${MOVE.cx}" cy="${MOVE.cy}" r="${MOVE.r}" fill="#262b38" stroke="#4a5266" stroke-width="2"/>
+      <circle cx="${MOVE.cx}" cy="${MOVE.cy}" r="16" fill="#323848" stroke="#4a5266"/>
+      ${["M71 214 l7 9 h-14z", "M71 294 l7 -9 h-14z", "M31 254 l9 -7 v14z", "M111 254 l-9 -7 v14z"].map((d) => `<path d="${d}" fill="#7b8396"/>`).join("")}
+      <text x="${MOVE.cx}" y="${MOVE.cy + 64}" text-anchor="middle" font-size="9" fill="#c9c6bd">${esc(mk || "Move")}</text>
+    </g>`;
+    for (const t of items) {
+      const sel = selected && selected.p === pi && selected.id === t.id;
+      const lab = label(t);
+      if (t.r) {
+        s += `<g class="hud-hit${sel ? " active" : ""}" data-p="${pi}" data-id="${t.id}" tabindex="0" role="button" aria-label="${esc(t.name)}">
+          <circle cx="${t.x}" cy="${t.y}" r="${t.r}" fill="#262b38" stroke="${t.color}" stroke-width="3"/>
+          <text x="${t.x}" y="${t.y + 4}" text-anchor="middle" font-size="10" font-weight="700" fill="#e9e6dd">${esc(t.short || t.name)}</text>
+          <text x="${t.x}" y="${t.y - t.r - 4}" text-anchor="middle" font-size="8.5" fill="#e8b64a">${esc(lab)}</text>
+        </g>`;
+      } else {
+        s += `<g class="hud-hit${sel ? " active" : ""}" data-p="${pi}" data-id="${t.id}" tabindex="0" role="button" aria-label="${esc(t.name)}">
+          <rect x="${t.x - t.w / 2}" y="${t.y - t.h / 2}" width="${t.w}" height="${t.h}" rx="3" fill="#262b38" stroke="#4a5266" stroke-width="1.5"/>
+          <text x="${t.x}" y="${t.y + 3.5}" text-anchor="middle" font-size="9" font-weight="700" fill="#7fd08f">${esc((t.short || t.name).toUpperCase())}</text>
+          ${lab ? (t.id === "pause"
+            ? `<text x="${t.x}" y="${t.y + t.h / 2 + 11}" text-anchor="middle" font-size="8.5" fill="#e8b64a">${esc(lab)}</text>`
+            : `<text x="${t.x - t.w / 2 - 4}" y="${t.y + 3.5}" text-anchor="end" font-size="8.5" fill="#e8b64a">${esc(lab)}</text>`) : ""}
+        </g>`;
+      }
+    }
+    s += `</svg>`;
+    return s;
+  }
+
+  function slot(pi, kind, id, value, extra = "") {
+    const isListen = listening && listening.p === pi && listening.kind === kind && listening.id === id && (listening.dir ?? null) === (extra === "" ? null : Number(extra));
+    const text = isListen ? (kind === "pad" ? "press button…" : "press key…") : (value ? (kind === "pad" ? PAD_LABEL[value] || value : value) : "not set");
+    const dup = value && kind !== "pad" && duplicates().has(value);
+    return `<button type="button" class="slot${value ? "" : " empty"}${isListen ? " listening" : ""}${dup ? " dup" : ""}" data-p="${pi}" data-kind="${kind}" data-id="${id}" ${extra !== "" ? `data-dir="${extra}"` : ""}>${esc(text)}</button>`;
+  }
+
+  function winSize(pi) {
+    const v = state.players[pi].size;
+    return v || (pi === 0 ? "2" : "1");
+  }
+
+  function playerPanel(pi) {
+    const pl = state.players[pi];
+    const items = LAYOUTS[pl.layout];
+    const dirs = ["Up", "Down", "Left", "Right"];
+    let rows = `<tr class="${selected && selected.p === pi && selected.id === "move" ? "active" : ""}">
+      <td class="what">Move</td>
+      <td><div class="move-keys">${dirs.map((d, i) => `<div><small>${d}</small>${slot(pi, "move", "move", pl.moveKeys[i], i)}</div>`).join("")}</div></td>
+      <td>${pl.controller ? `<label class="check"><input type="checkbox" id="p${pi}-dpad" data-p="${pi}" data-opt="padDpad" ${pl.padDpad ? "checked" : ""}> D-pad</label><br><label class="check"><input type="checkbox" id="p${pi}-stick" data-p="${pi}" data-opt="padStick" ${pl.padStick ? "checked" : ""}> Left stick</label>` : `<span class="hint">No controller</span>`}</td>
+    </tr>`;
+    for (const t of items) {
+      rows += `<tr class="${selected && selected.p === pi && selected.id === t.id ? "active" : ""}">
+        <td class="what">${esc(t.name)}</td>
+        <td><div class="binds-cell">${slot(pi, "key", t.id, pl.keys[t.id])}${((pl.xkeys || {})[t.id] || []).map((v, i) => slot(pi, "key", t.id, v, i + 1)).join("")}<button type="button" class="add" data-add="key" data-p="${pi}" data-id="${t.id}" aria-label="Add another key for ${esc(t.name)}">+</button></div></td>
+        <td>${pl.controller ? `<div class="binds-cell">${slot(pi, "pad", t.id, pl.pad[t.id])}${((pl.xpad || {})[t.id] || []).map((v, i) => slot(pi, "pad", t.id, v, i + 1)).join("")}<button type="button" class="add" data-add="pad" data-p="${pi}" data-id="${t.id}" aria-label="Add another button for ${esc(t.name)}">+</button></div>` : `<span class="hint">—</span>`}</td>
+      </tr>`;
+    }
+    const size = winSize(pi);
+    const sizeOpts = [["1", "Original (480×320)"], ["1.5", "1.5×"], ["2", "2× (960×640)"], ["2.5", "2.5×"], ["3", "3× (1440×960)"], ["full", "Full screen"]]
+      .map(([v, l]) => `<option value="${v}" ${size === v ? "selected" : ""}>${l}</option>`).join("");
+    const ctlOpts = [0, 1, 2, 3, 4].map((n) => `<option value="${n}" ${pl.controller === n ? "selected" : ""}>${n ? "Controller " + n : "Keyboard only"}</option>`).join("");
+    return `<section class="player" data-p="${pi + 1}" aria-label="Player ${pi + 1}">
+      <div class="player-head">
+        <h2><span class="tag">${pi + 1}P</span> ${pi === 0 ? "Billy's side" : "Jimmy's side"}</h2>
+        <div class="seg" data-p="${pi}" data-role="layout">
+          <button type="button" data-layout="auto" aria-pressed="${pl.layout === "auto"}">Auto mode</button>
+          <button type="button" data-layout="manual" aria-pressed="${pl.layout === "manual"}">Manual mode</button>
+        </div>
+      </div>
+      <div class="controls-row">
+        <label for="p${pi}-ctl"><span class="label">Controller</span>
+          <select id="p${pi}-ctl" data-p="${pi}" data-role="ctl">${ctlOpts}</select></label>
+        <label for="p${pi}-size"><span class="label">Window size</span>
+          <select id="p${pi}-size" data-p="${pi}" data-role="size">${sizeOpts}</select></label>
+      </div>
+      ${hudSvg(pi, pl)}
+      <p class="hint">Click a button on the pad or in the table, then press the key or controller button to use. Use the same Play Mode (Options → Play Mode) in the game for this player.</p>
+      <div style="overflow-x:auto"><table class="binds">
+        <thead><tr><th>Action</th><th>Keyboard</th><th>Controller</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </section>`;
+  }
+
+  function duplicates() {
+    const seen = new Map(), dup = new Set();
+    const n = state.count;
+    for (let pi = 0; pi < n; pi++) {
+      const pl = state.players[pi];
+      const ids = new Set(LAYOUTS[pl.layout].map((t) => t.id));
+      const vals = [...pl.moveKeys.filter(Boolean), ...[...ids].flatMap((id) => allKeys(pl, id))];
+      for (const v of vals) { if (seen.has(v)) dup.add(v); seen.set(v, 1); }
+    }
+    return dup;
+  }
+
+  function render() {
+    document.querySelectorAll("#players-seg button").forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.n) === state.count)));
+    $("#speed").value = String(state.speed || 15);
+    $("#classic").checked = !!state.classic;
+    $("#hidepad").checked = !!state.hidePad;
+    const wrap = $("#players");
+    wrap.innerHTML = [0, 1].slice(0, state.count).map(playerPanel).join("");
+    // warnings
+    const warns = [];
+    const dup = duplicates();
+    if (dup.size) warns.push(`These keys are used more than once: <b>${[...dup].map(esc).join(", ")}</b>. Each key should do one thing (both windows share the keyboard).`);
+    if (state.count === 2 && state.players[0].controller && state.players[0].controller === state.players[1].controller)
+      warns.push("Both players are set to the same controller number.");
+    const wb = $("#warn-banner");
+    wb.hidden = !warns.length; wb.innerHTML = warns.join("<br>");
+    const lb = $("#listen-banner");
+    if (listening) {
+      lb.hidden = false;
+      const what = listening.kind === "move" ? ["Up", "Down", "Left", "Right"][listening.dir] + " movement" : LAYOUTS[state.players[listening.p].layout].find((t) => t.id === listening.id).name;
+      lb.innerHTML = listening.kind === "pad"
+        ? `Player ${listening.p + 1}, <b>${esc(what)}</b>: press a button on controller ${state.players[listening.p].controller}. Press Esc to cancel, Delete to clear.`
+        : `Player ${listening.p + 1}, <b>${esc(what)}</b>: press a key. Press Esc to cancel, Delete to clear.`;
+    } else lb.hidden = true;
+    $("#bat").textContent = buildBat();
+    save();
+  }
+
+  // ---- Launcher generation ----
+  function q(arg) { return /[\s"]/.test(arg) ? `"${arg.replace(/"/g, "")}"` : arg; }
+  function argsFor(pi) { return argsList(pi).map(q).join(" "); }
+  function argsList(pi) {
+    const pl = state.players[pi];
+    const a = [];
+    const items = LAYOUTS[pl.layout];
+    const keysMove = pl.moveKeys.every(Boolean);
+    if (keysMove || (pl.controller && pl.padDpad)) a.push(`--dpad-to-touch=${MOVE.dpad.join(",")}`);
+    if (pl.controller && pl.padStick) a.push(`--stick-to-touch=${MOVE.stick.join(",")}`);
+    if (keysMove) a.push(`--keys-to-dpad=${pl.moveKeys.join(",")}`);
+    for (const t of items) {
+      for (const k of allKeys(pl, t.id)) a.push(`--key-to-touch=${k},${t.x},${t.y}`);
+      for (const b of allPads(pl, t.id)) a.push(`--button-to-touch=${b},${t.x},${t.y}`);
+    }
+    // Screen-aware rules: the game's current screen is read from APPLET::pApp->state.
+    a.push(`--context-probe=${SCREENS.probe}`);
+    for (const k of allKeys(pl, "pause")) a.push(`--context-key=${SCREENS.pause},${k},${SCREENS.resume.join(",")}`);
+    for (const b of allPads(pl, "pause")) a.push(`--context-button=${SCREENS.pause},${b},${SCREENS.resume.join(",")}`);
+    a.push(`--context-menu=${SCREENS.pause},${SCREENS.pauseItems.flat().join(",")}`);
+    a.push(`--context-pointer-menu=${SCREENS.cont},${SCREENS.contItems.flat().join(",")}`);
+    const hit = pl.layout === "manual" ? "punch" : "attack";
+    for (const k of new Set(["pause", hit, "jump"].flatMap((id) => allKeys(pl, id)))) a.push(`--menu-confirm-key=${k}`);
+    for (const b of new Set(["pause", hit, "jump"].flatMap((id) => allPads(pl, id)))) a.push(`--menu-confirm-button=${b}`);
+    // Menus: d-pad moves between the game's own buttons, D goes back.
+    a.push("--touch-plate-nav", `--plate-nav-exclude=${SCREENS.gameplay}`);
+    // Bug fix: the game's "frames too fast" check (enabled in every stage, never
+    // disabled) can stop the frame loop while "Now Loading" runs after quitting,
+    // freezing the game. Setting its 0.02 s threshold to 0 means it never fires.
+    a.push("--patch-u32=0xc380,0x47ae147b,0x0", "--patch-u32=0xc384,0x3f947ae1,0x0");
+
+    // Options screen: a scrolling list. Rows are 50 apart; arrows scroll it.
+    a.push(`--context-list-menu=${SCREENS.options},230,53,50,280,44,4,8,375,38,375,240,448,22`);
+    // Classic combos: small changes to the game's own move code (same for both
+    // players, so co-op windows stay in sync). Left/Right + D = headbutt (instead
+    // of Up + D); Jump + Punch/Attack within 2 frames = back elbow (instead of
+    // Down + D); Up/Down + D become a plain D.
+    if (state.classic) a.push(...CLASSIC_PATCH);
+    if (state.hidePad) a.push(...HIDE_PAD_PATCH);
+    // First-run Auto/Manual prompt: its two choices aren't in the game's button list.
+    a.push(`--context-extra-buttons=${SCREENS.modePrompt},120,248,120,24,360,248,120,24`);
+    for (const k of allKeys(pl, "d")) a.push(`--menu-back-key=${k}`);
+    for (const b of allPads(pl, "d")) a.push(`--menu-back-button=${b}`);
+    const hi = SPEED_HI[state.speed || 15];
+    if (hi) for (const addr of SPEED_ADDRS) a.push(`--patch-u32=${addr},0x3fb11111,${hi}`);
+    a.push(`--controller=${pl.controller || 99}`);
+    const size = winSize(pi);
+    if (size === "full") a.push("--fullscreen");
+    else if (size !== "1") a.push(`--window-scale=${size}`);
+    if (!pl.controller) a.push("--disable-analog-stick-tilt-controls");
+    return a;
+  }
+  function buildBat(count = state.count) {
+    const L = [];
+    L.push("@echo off");
+    L.push("rem Double Dragon launcher - made with the Double Dragon Controls page");
+    L.push('cd /d "%~dp0"');
+    L.push('if not exist "touchHLE.exe" ( echo touchHLE.exe was not found in this folder. & pause & exit /b 1 )');
+    L.push('if not exist "DoubleDragon.ipa" ( echo DoubleDragon.ipa was not found in this folder. & pause & exit /b 1 )');
+    if (count === 1) {
+      L.push(`start "Double Dragon" touchHLE.exe DoubleDragon.ipa ${argsFor(0)}`);
+    } else {
+      L.push("rem Player 1 hosts the link, player 2 joins it. Each keeps its own save data.");
+      L.push(`start "Double Dragon 1P" touchHLE.exe DoubleDragon.ipa --gamekit-host=47800 ${argsFor(0)}`);
+      L.push("timeout /t 2 /nobreak >nul");
+      L.push(`start "Double Dragon 2P" touchHLE.exe DoubleDragon.ipa --gamekit-join=127.0.0.1:47800 --sandbox=touchHLE_sandbox_p2 ${argsFor(1)}`);
+    }
+    return L.join("\r\n") + "\r\n";
+  }
+  function readme() {
+    return [
+      "Double Dragon launcher",
+      "",
+      "1. Put these .bat files next to touchHLE.exe (patched build) and DoubleDragon.ipa.",
+      "2. Double-click \"Play Double Dragon - 1 player.bat\" to play alone,",
+      "   or \"Play Double Dragon - 2 players.bat\" for co-op (opens two linked windows).",
+      "3. Co-op: in both windows go to Mode Select > Double Dragon Mode > Matching Start.",
+      "   Pausing pauses both windows, and each player presses Pause to resume.",
+      "",
+      "Player 2's save data is kept in touchHLE_sandbox_p2.",
+      "If a controller number is wrong, swap Controller 1 and 2 on the Controls page and download again.",
+      "",
+    ].join("\r\n");
+  }
+
+  // ---- Minimal ZIP writer (stored, no compression) ----
+  const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+  const crc32 = (b) => { let c = 0xffffffff; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; };
+  function makeZip(files) {
+    const enc = new TextEncoder(); const parts = []; const central = []; let off = 0;
+    const d = new Date();
+    const dosTime = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+    const dosDate = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+    for (const f of files) {
+      const name = enc.encode(f.name), data = enc.encode(f.data), crc = crc32(data);
+      const h = new DataView(new ArrayBuffer(30));
+      h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+      h.setUint16(10, dosTime, true); h.setUint16(12, dosDate, true); h.setUint32(14, crc, true);
+      h.setUint32(18, data.length, true); h.setUint32(22, data.length, true); h.setUint16(26, name.length, true); h.setUint16(28, 0, true);
+      parts.push(new Uint8Array(h.buffer), name, data);
+      const c = new DataView(new ArrayBuffer(46));
+      c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true);
+      c.setUint16(12, dosTime, true); c.setUint16(14, dosDate, true); c.setUint32(16, crc, true);
+      c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, name.length, true);
+      c.setUint32(42, off, true);
+      central.push(new Uint8Array(c.buffer), name);
+      off += 30 + name.length + data.length;
+    }
+    const cSize = central.reduce((s, p) => s + p.length, 0);
+    const e = new DataView(new ArrayBuffer(22));
+    e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+    e.setUint32(12, cSize, true); e.setUint32(16, off, true);
+    return new Blob([...parts, ...central, new Uint8Array(e.buffer)], { type: "application/zip" });
+  }
+
+  // ---- Interaction ----
+  function startListen(p, kind, id, dir) {
+    listening = { p, kind, id, dir: dir ?? null };
+    selected = { p, id };
+    render();
+  }
+  function stopListen() {
+    listening = null;
+    for (const pl of state.players) for (const k of ["xkeys", "xpad"]) for (const id in pl[k] || {}) pl[k][id] = pl[k][id].filter(Boolean);
+    render();
+  }
+
+  document.addEventListener("click", (e) => {
+    const segP = e.target.closest("#players-seg button");
+    if (segP) { state.count = Number(segP.dataset.n); listening = null; render(); return; }
+    const lay = e.target.closest('[data-role="layout"] button');
+    if (lay) { const p = Number(lay.parentElement.dataset.p); state.players[p].layout = lay.dataset.layout; listening = null; selected = null; render(); return; }
+    const add = e.target.closest(".add");
+    if (add) {
+      const p = Number(add.dataset.p), kind = add.dataset.add, id = add.dataset.id, pl = state.players[p];
+      const all = (pl[extraKey(kind)] = pl[extraKey(kind)] || {});
+      const arr = (all[id] = (all[id] || []).filter(Boolean));
+      arr.push("");
+      startListen(p, kind, id, arr.length);
+      return;
+    }
+    const sl = e.target.closest(".slot");
+    if (sl) {
+      const p = Number(sl.dataset.p), kind = sl.dataset.kind, id = sl.dataset.id, dir = sl.dataset.dir !== undefined ? Number(sl.dataset.dir) : null;
+      if (listening && listening.p === p && listening.kind === kind && listening.id === id && listening.dir === dir) { stopListen(); return; }
+      startListen(p, kind, id, dir); return;
+    }
+    const hit = e.target.closest(".hud-hit");
+    if (hit) {
+      const p = Number(hit.dataset.p), id = hit.dataset.id;
+      if (id === "move") startListen(p, "move", "move", 0);
+      else startListen(p, state.players[p].controller && lastInputWasPad ? "pad" : "key", id);
+      return;
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    const hit = e.target.closest && e.target.closest(".hud-hit");
+    if (!listening && hit && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); hit.dispatchEvent(new MouseEvent("click", { bubbles: true })); return; }
+    if (!listening) return;
+    e.preventDefault();
+    if (e.code === "Escape") { stopListen(); return; }
+    const pl = state.players[listening.p];
+    if (e.code === "Delete") {
+      if (listening.kind === "move") pl.moveKeys[listening.dir] = "";
+      else setBind(pl, listening.kind, listening.id, listening.dir, null);
+      stopListen(); return;
+    }
+    if (listening.kind === "pad") return;
+    if (e.code === "F12") { flash("F12 is reserved by touchHLE. Pick another key.", true); return; }
+    const name = sdlKeyName(e.code);
+    if (!name) { flash("That key can't be used. Pick another key.", true); return; }
+    if (listening.kind === "move") {
+      pl.moveKeys[listening.dir] = name;
+      if (listening.dir < 3) { listening.dir += 1; render(); return; }
+    } else setBind(pl, "key", listening.id, listening.dir, name);
+    stopListen();
+  });
+  document.addEventListener("change", (e) => {
+    const t = e.target;
+    if (t.matches('select[data-role="ctl"]')) { state.players[Number(t.dataset.p)].controller = Number(t.value); listening = null; render(); }
+    if (t.id === "speed") { state.speed = Number(t.value); render(); }
+    if (t.id === "classic") { state.classic = t.checked; render(); }
+    if (t.id === "hidepad") { state.hidePad = t.checked; render(); }
+    if (t.matches('select[data-role="size"]')) { state.players[Number(t.dataset.p)].size = t.value; render(); }
+    if (t.matches("input[data-opt]")) { state.players[Number(t.dataset.p)][t.dataset.opt] = t.checked; render(); }
+  });
+
+  // ---- Gamepads ----
+  let lastInputWasPad = false;
+  let prevButtons = {};
+  function pollPads() {
+    let pads = [];
+    try { pads = navigator.getGamepads ? [...navigator.getGamepads()].filter(Boolean) : []; } catch (e) { pads = []; }
+    const chips = $("#pads");
+    const html = pads.length
+      ? pads.map((g, i) => {
+          const pressed = g.buttons.map((b, bi) => (b.pressed ? PAD_NAMES[bi] || (bi >= 12 && bi <= 15 ? "D-pad" : bi === 6 ? "LT" : bi === 7 ? "RT" : "#" + bi) : null)).filter(Boolean);
+          return `<span class="pad-chip">Controller ${i + 1}: ${esc(g.id.replace(/\s*\(.*\)\s*/g, " ").trim().slice(0, 32))}${pressed.length ? ` <b>${esc(pressed.map((n) => PAD_LABEL[n] || n).join(" "))}</b>` : ""}</span>`;
+        }).join("")
+      : `<span class="pad-chip">None yet. Press any button on a controller.</span>`;
+    if (chips.innerHTML !== html) chips.innerHTML = html;
+    pads.forEach((g, i) => {
+      const prev = prevButtons[i] || [];
+      g.buttons.forEach((b, bi) => {
+        if (b.pressed && !prev[bi]) onPadPress(i, bi);
+      });
+      prevButtons[i] = g.buttons.map((b) => b.pressed);
+    });
+    requestAnimationFrame(pollPads);
+  }
+  function onPadPress(padIndex, bi) {
+    lastInputWasPad = true;
+    if (!listening || listening.kind !== "pad") return;
+    const pl = state.players[listening.p];
+    if (pl.controller && padIndex !== pl.controller - 1) {
+      flash(`That was controller ${padIndex + 1}. Player ${listening.p + 1} is set to controller ${pl.controller}.`, true); return;
+    }
+    if (bi >= 12 && bi <= 15) { flash("The D-pad is used for movement. Pick another button.", true); return; }
+    const name = PAD_NAMES[bi];
+    if (!name) { flash("That button can't be bound. Pick another one.", true); return; }
+    setBind(pl, "pad", listening.id, listening.dir, name);
+    stopListen();
+  }
+  document.addEventListener("keydown", () => { lastInputWasPad = false; }, true);
+  requestAnimationFrame(pollPads);
+
+  // Controller binding without a detected controller: cycle through names on click with Shift
+  // (kept simple: right-click a controller slot to choose from a list).
+  document.addEventListener("contextmenu", (e) => {
+    const sl = e.target.closest('.slot[data-kind="pad"]');
+    if (!sl) return;
+    e.preventDefault();
+    const p = Number(sl.dataset.p), id = sl.dataset.id;
+    const order = ["A", "B", "X", "Y", "LeftShoulder", "RightShoulder", "LeftTrigger", "RightTrigger", "Start", "Back", "LeftStick", "RightStick", ""];
+    const cur = state.players[p].pad[id] || "";
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    if (next) state.players[p].pad[id] = next; else delete state.players[p].pad[id];
+    listening = null; render();
+  });
+
+  // ---- Output buttons ----
+  let flashTimer;
+  function flash(msg, err) {
+    const s = $("#status"); s.textContent = msg; s.className = "status " + (err ? "err" : "ok");
+    clearTimeout(flashTimer); flashTimer = setTimeout(() => { s.textContent = ""; s.className = "status"; }, 5000);
+  }
+  $("#copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(buildBat()); flash("Copied. Paste into Notepad and save it with a .bat ending, for example Play Double Dragon.bat."); }
+    catch (e) {
+      const r = document.createRange(); r.selectNodeContents($("#bat"));
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+      flash("Copy was blocked here. The script is selected below, so press Ctrl+C.", true);
+    }
+  });
+  let downloads = null;
+  const dlBtn = $("#dl");
+  dlBtn.addEventListener("click", async () => {
+    if (!downloads) { flash("Downloads aren't available in this view. Use Copy launcher text.", true); return; }
+    const files = [{ name: "Play Double Dragon - 1 player.bat", data: buildBat(1) }];
+    if (state.count === 2) files.push({ name: "Play Double Dragon - 2 players.bat", data: buildBat(2) });
+    files.push({ name: "README.txt", data: readme() });
+    const zip = makeZip(files);
+    try { await downloads.save({ filename: "DoubleDragon-launcher.zip", data: zip }); flash("Saved DoubleDragon-launcher.zip."); }
+    catch (e) {
+      if (e && e.code === "declined") flash("Download cancelled.", true);
+      else if (e && e.code === "rate_limited") flash("A save prompt is already open.", true);
+      else flash("Couldn't save the file here. Use Copy launcher text.", true);
+    }
+  });
+  if (window.claude && window.claude.use) {
+    window.claude.use("downloads").then((d) => { downloads = d; }).catch(() => {});
+  }
+
+  if (APP) {
+    $("#bat-out").hidden = true;
+    $("#app-play").hidden = false;
+    $(".wrap").insertBefore($("#app-play"), $(".bar"));
+    $(".lede").textContent = "Bind your keyboard keys and controller buttons to the game's on-screen pad, for one or two players, then press Play. For two players, two linked windows open.";
+    const showIpa = (name) => {
+      APP.ipa = name;
+      $("#ipa-line").innerHTML = name
+        ? `Game file: <code>${esc(name)}</code> (in the <b>game</b> folder).`
+        : `No game file yet. Click <b>Open game folder</b>, put <code>DoubleDragon.ipa</code> in it, then come back here.`;
+      $("#play1").disabled = $("#play2").disabled = !name;
+    };
+    window.ddAppIpa = showIpa;
+    window.ddAppStatus = (msg) => { const s = $("#app-status"); s.textContent = msg; s.className = "status ok"; };
+    showIpa(APP.ipa);
+    window.addEventListener("focus", () => toApp({ type: "refresh" }));
+    const go = (count) => {
+      if (state.count !== count) { state.count = count; render(); }
+      $("#app-status").textContent = "Starting…";
+      toApp({ type: "play", count, args: [argsList(0), argsList(1)] });
+    };
+    $("#play1").addEventListener("click", () => go(1));
+    $("#play2").addEventListener("click", () => go(2));
+    $("#open-game").addEventListener("click", () => toApp({ type: "open", folder: "game" }));
+    $("#open-saves").addEventListener("click", () => toApp({ type: "open", folder: "saves" }));
+  }
+
+  render();
+})();
+</script>
