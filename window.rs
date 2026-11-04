@@ -1,0 +1,2874 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+//! Abstraction of window setup, OpenGL context creation and event handling.
+//!
+//! Implemented using the sdl2 crate (a Rust wrapper for SDL2). All usage of
+//! SDL should be confined to this module.
+//!
+//! There is currently no separation of concerns between a single window and
+//! window system interaction in general, because it is assumed only one window
+//! will be needed for the runtime of the app.
+
+use crate::gles::present::present_frame;
+use crate::gles::{create_gles1_ctx_no_parent_stack, GLESContext, GLES};
+use crate::image::Image;
+use crate::matrix::Matrix;
+use crate::options::Options;
+use crate::Environment;
+use sdl2::mouse::MouseButton;
+use sdl2::pixels::PixelFormatEnum;
+use sdl2::surface::Surface;
+use sdl2_sys::SDL_PowerState;
+use std::collections::{HashMap, VecDeque};
+use std::env;
+use std::f32::consts::{FRAC_PI_2, PI};
+use std::num::NonZeroU32;
+use std::ptr::null_mut;
+use std::time::{Duration, Instant};
+
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum DeviceFamily {
+    iPhone,
+    iPad,
+}
+impl std::fmt::Display for DeviceFamily {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
+}
+impl DeviceFamily {
+    pub fn portrait_size(&self) -> (u32, u32) {
+        match self {
+            DeviceFamily::iPhone => (320, 480),
+            DeviceFamily::iPad => (768, 1024),
+        }
+    }
+}
+impl TryFrom<u64> for DeviceFamily {
+    type Error = ();
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(DeviceFamily::iPhone),
+            2 => Ok(DeviceFamily::iPad),
+            _ => Err(()),
+        }
+    }
+}
+impl TryFrom<&str> for DeviceFamily {
+    type Error = ();
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "iphone" => Ok(DeviceFamily::iPhone),
+            "ipad" => Ok(DeviceFamily::iPad),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum DeviceOrientation {
+    Portrait,
+    PortraitUpsideDown,
+    LandscapeLeft,
+    LandscapeRight,
+}
+fn size_for_orientation(
+    family: DeviceFamily,
+    orientation: DeviceOrientation,
+    scale_hack: NonZeroU32,
+) -> (u32, u32) {
+    let (width, height) = family.portrait_size();
+    let scale_hack = scale_hack.get();
+    match orientation {
+        DeviceOrientation::Portrait => (width * scale_hack, height * scale_hack),
+        DeviceOrientation::PortraitUpsideDown => (width * scale_hack, height * scale_hack),
+        DeviceOrientation::LandscapeLeft => (height * scale_hack, width * scale_hack),
+        DeviceOrientation::LandscapeRight => (height * scale_hack, width * scale_hack),
+    }
+}
+fn rotate_fullscreen_size(orientation: DeviceOrientation, screen_size: (u32, u32)) -> (u32, u32) {
+    let (short_side, long_side) = if screen_size.0 < screen_size.1 {
+        (screen_size.0, screen_size.1)
+    } else {
+        (screen_size.1, screen_size.0)
+    };
+    match orientation {
+        DeviceOrientation::Portrait | DeviceOrientation::PortraitUpsideDown => {
+            (short_side, long_side)
+        }
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight => {
+            (long_side, short_side)
+        }
+    }
+}
+/// Tell SDL2 what orientation we want. Only useful on Android.
+fn set_sdl2_orientation(orientation: DeviceOrientation) {
+    // Despite the name, this hint works on Android too.
+    sdl2::hint::set(
+        "SDL_IOS_ORIENTATIONS",
+        match orientation {
+            DeviceOrientation::Portrait => "Portrait",
+            // The inversion is deliberate. These probably correspond to
+            // iPhone OS content orientations?
+            DeviceOrientation::PortraitUpsideDown => "PortraitUpsideDown",
+            DeviceOrientation::LandscapeLeft => "LandscapeRight",
+            DeviceOrientation::LandscapeRight => "LandscapeLeft",
+        },
+    );
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FingerId {
+    Mouse,
+    Touch(i64),
+    VirtualCursor,
+    ButtonToTouch(crate::options::Button),
+    StickToTouch,
+    DpadToTouch,
+    KeyToTouch(u32),
+    Context(u32),
+    /// Local: touches made up by the classic-combo filter.
+    Combo(u32),
+}
+pub type Coords = (f32, f32);
+
+/// Local: outline drawn around the selected on-screen button, in window
+/// coordinates (x, y, w, h). Set when the frame's cursor is queried.
+/// Local (test-only): shared clock for latency measurements.
+pub static DEBUG_T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+pub fn debug_ms() -> u128 {
+    DEBUG_T0.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// Local: on-screen y of a list-menu row. Once scrolled, the list settles
+/// slightly lower than a whole number of rows.
+fn list_row_y(lm: &crate::options::ListMenu, sel: usize, scroll: usize) -> f32 {
+    let adjust = if scroll > 0 { 9.0 } else { 0.0 };
+    lm.y0 + (sel - scroll) as f32 * lm.step + adjust
+}
+
+pub static MENU_HIGHLIGHT: std::sync::Mutex<Option<[f32; 4]>> = std::sync::Mutex::new(None);
+
+/// Local: an on-screen button reported by the app (see `--touch-plate-nav`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plate {
+    pub cx: f32,
+    pub cy: f32,
+    pub w: f32,
+    pub h: f32,
+    pub flags: u32,
+    pub num: i32,
+}
+
+/// Local: an input that screen-dependent rules can match.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum CtxInput {
+    Button(crate::options::Button),
+    Key(sdl2::keyboard::Keycode),
+}
+
+#[derive(Clone, Copy)]
+enum KeyAction {
+    Touch(u32, f32, f32),
+    DpadUp,
+    DpadDown,
+    DpadLeft,
+    DpadRight,
+}
+
+/// Local: forwards raw key presses between two linked touchHLE instances, so
+/// that a keyboard player is not affected by which window has focus.
+struct KeyLink {
+    socket: std::net::UdpSocket,
+    peer: Option<std::net::SocketAddr>,
+}
+
+/// Local: state of the classic-combo filter (see `combo_process`).
+#[derive(Default)]
+struct ComboState {
+    /// How many events at the front of the queue were already filtered.
+    filtered: usize,
+    /// Made-up events waiting for their time.
+    pending: Vec<(Instant, Event)>,
+    /// A jump/punch press held back briefly to see if the other follows.
+    buffered: Option<(FingerId, Coords, Instant)>,
+    /// Button releases to drop (their presses became a combo).
+    swallow_up: std::collections::HashSet<FingerId>,
+    /// The movement finger temporarily moved to another direction.
+    hold: Option<ComboHold>,
+}
+
+struct ComboHold {
+    finger: FingerId,
+    /// Where the player's real input is (None: released meanwhile).
+    real: Option<Coords>,
+    /// Where the finger was put.
+    forced: Coords,
+    /// The finger was made up (no movement was held).
+    synthetic: bool,
+    /// The button press the combo sends, and when it goes down.
+    button: (FingerId, Coords),
+    button_down_at: Instant,
+    /// Fingers whose release ends the combo; set once one is released.
+    triggers: Vec<FingerId>,
+    released: bool,
+    /// The finger was lifted (not moved) for the combo.
+    lifted: bool,
+}
+
+struct DpadState {
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    active: bool,
+}
+
+#[derive(Debug)]
+pub enum TextInputEvent {
+    Text(String),
+    Backspace,
+    Return,
+}
+
+#[derive(Debug)]
+pub enum Event {
+    /// User requested quit.
+    Quit,
+    /// OS has informed touchHLE it will soon become inactive.
+    /// (iOS `applicationWillResignActive:`, Android `onPause()`)
+    AppWillResignActive,
+    /// OS has informed touchHLE it will soon terminate.
+    /// (iOS `applicationWillTerminate:`, Android `onDestroy()`)
+    AppWillTerminate,
+    TouchesDown(HashMap<FingerId, Coords>),
+    TouchesMove(HashMap<FingerId, Coords>),
+    TouchesUp(HashMap<FingerId, Coords>),
+    /// User pressed F12, requesting that execution be paused and the debugger
+    /// take over.
+    EnterDebugger,
+    TextInput(TextInputEvent),
+}
+
+pub enum BatteryState {
+    Unknown,
+    OnBattery,
+    NoBattery,
+    Charging,
+    Full,
+}
+
+pub enum GLVersion {
+    /// OpenGL ES 1.1
+    GLES11,
+    /// OpenGL 2.1 compatibility profile
+    GL21Compat,
+}
+
+pub struct GLContext(sdl2::video::GLContext);
+
+impl GLContext {
+    pub fn is_current(&self) -> bool {
+        self.0.is_current()
+    }
+}
+
+fn surface_from_image(image: &Image) -> Surface<'_> {
+    let src_pixels = image.pixels();
+    let (width, height) = image.dimensions();
+
+    let mut surface = Surface::new(width, height, PixelFormatEnum::RGBA32).unwrap();
+    let (width, height) = (width as usize, height as usize);
+    let pitch = surface.pitch() as usize;
+    surface.with_lock_mut(|dst_pixels| {
+        for y in 0..height {
+            for x in 0..width {
+                for channel in 0..4 {
+                    let src_idx = y * width * 4 + x * 4 + channel;
+                    let dst_idx = y * pitch + x * 4 + channel;
+                    dst_pixels[dst_idx] = src_pixels[src_idx];
+                }
+            }
+        }
+    });
+    surface
+}
+
+pub struct Window {
+    _sdl_ctx: sdl2::Sdl,
+    video_ctx: sdl2::VideoSubsystem,
+    window: sdl2::video::Window,
+    event_pump: sdl2::EventPump,
+    event_queue: VecDeque<Event>,
+    last_polled: Instant,
+    /// Separate queue for extremely high-priority events (e.g. app about to
+    /// terminate).
+    high_priority_event: Option<Event>,
+    enable_event_polling: bool,
+    #[cfg(target_os = "macos")]
+    max_height: u32,
+    #[cfg(target_os = "macos")]
+    viewport_y_offset: u32,
+    /// Copy of `fullscreen` on [Options]. Note that this is meaningless when
+    /// [Self::rotatable_fullscreen] returns [true].
+    fullscreen: bool,
+    scale_hack: NonZeroU32,
+    internal_gl_ins: Option<Box<dyn GLESContext>>,
+    splash_image: Option<Image>,
+    device_family: DeviceFamily,
+    device_orientation: DeviceOrientation,
+    controller_ctx: sdl2::GameControllerSubsystem,
+    controllers: Vec<sdl2::controller::GameController>,
+    dpad_state: DpadState,
+    key_map: Vec<(sdl2::keyboard::Keycode, KeyAction)>,
+    keys_down: std::collections::HashSet<sdl2::keyboard::Keycode>,
+    key_link: Option<KeyLink>,
+    controller_choice: Option<u32>,
+    context: Vec<u32>,
+    ctx_held: HashMap<CtxInput, (FingerId, Coords)>,
+    ctx_swallowed: std::collections::HashSet<CtxInput>,
+    menu_sel: Option<(u32, usize)>,
+    menu_pointer: Option<(f32, f32)>,
+    menu_ctx_active: bool,
+    /// Local: (screen, selected row, scroll, row tapped yet) for list menus.
+    list_state: Option<(u32, usize, usize, bool)>,
+    list_menu: Option<crate::options::ListMenu>,
+    list_busy_until: Option<Instant>,
+    combo: ComboState,
+    /// Local: analog triggers currently counted as pressed (left, right).
+    triggers_down: [bool; 2],
+    plates: Vec<Plate>,
+    plates_seen: Vec<(Instant, Vec<Plate>)>,
+    plate_sel: Option<(f32, f32)>,
+    plate_user_moved: bool,
+    plate_nav_was_active: bool,
+    move_touch_last: HashMap<FingerId, Coords>,
+    cursor_last_aim: Option<Instant>,
+    plate_followup: Option<(Instant, (f32, f32), bool)>,
+    pending_ups: Vec<(Instant, Event)>,
+    ctx_key_taps: Vec<(usize, sdl2::keyboard::Keycode)>,
+    ctx_confirm_keys: Vec<sdl2::keyboard::Keycode>,
+    ctx_back_keys: Vec<sdl2::keyboard::Keycode>,
+    stick_active: bool,
+    _sensor_ctx: sdl2::SensorSubsystem,
+    accelerometer: Option<sdl2::sensor::Sensor>,
+    virtual_cursor_last: Option<(f32, f32, bool, bool)>,
+    virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
+    virtual_accelerometer_last: Option<(f32, f32, bool)>,
+    /// Whether or not we are on the "main" environment stack (rather than
+    /// a coroutine stack). Checked in various functions to make sure that
+    /// certain SDL functions (that call JNI functions) are on the main
+    /// stack on Android.
+    pub(super) on_main_stack: bool,
+}
+
+impl Window {
+    /// Returns [true] if touchHLE is running on a device where we should always
+    /// display fullscreen, but SDL2 will let us control the orientation, i.e.
+    /// Android devices.
+    pub fn rotatable_fullscreen() -> bool {
+        env::consts::OS == "android"
+    }
+    pub fn new(
+        title: &str,
+        icon: Option<Image>,
+        launch_image: Option<Image>,
+        options: &Options,
+    ) -> Window {
+        let sdl_ctx = sdl2::init().unwrap();
+        let video_ctx = sdl_ctx.video().unwrap();
+
+        // The "hidapi" feature of rust-sdl2 is enabled so that sdl2::sensor
+        // is available, but we don't want to enable SDL's HIDAPI controller
+        // drivers because they cause duplicated controllers on macOS
+        // (https://github.com/libsdl-org/SDL/issues/7479). Once that's fixed,
+        // remove this (https://github.com/touchHLE/touchHLE/issues/85).
+        sdl2::hint::set("SDL_JOYSTICK_HIDAPI", "0");
+
+        if env::consts::OS == "android" {
+            // It's important to set context version BEFORE window creation
+            // ref. https://wiki.libsdl.org/SDL2/SDL_GLattr
+            let attr = video_ctx.gl_attr();
+            attr.set_context_version(1, 1);
+            attr.set_context_profile(sdl2::video::GLProfile::GLES);
+
+            // Disable blocking of event loop when app is paused.
+            sdl2::hint::set("SDL_ANDROID_BLOCK_ON_PAUSE", "0");
+        }
+
+        // Separate mouse and touch events
+        sdl2::hint::set("SDL_TOUCH_MOUSE_EVENTS", "0");
+
+        // Local: let a window keep reading its controller while unfocused,
+        // so two linked instances can each have their own controller.
+        sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+
+        // Local: a click on an unfocused window should also reach the app,
+        // not just focus the window (two windows are used side by side).
+        sdl2::hint::set("SDL_MOUSE_FOCUS_CLICKTHROUGH", "1");
+
+        // Local: keyboard-to-touch mapping.
+        let mut key_map = Vec::new();
+        for (i, (name, x, y)) in options.key_to_touch.iter().enumerate() {
+            match sdl2::keyboard::Keycode::from_name(name) {
+                Some(k) => key_map.push((k, KeyAction::Touch(i as u32, *x, *y))),
+                None => {
+                    log!("Warning: unknown key name {:?} in --key-to-touch", name);
+                }
+            }
+        }
+        if let Some(names) = &options.keys_to_dpad {
+            let actions = [
+                KeyAction::DpadUp,
+                KeyAction::DpadDown,
+                KeyAction::DpadLeft,
+                KeyAction::DpadRight,
+            ];
+            for (name, action) in names.iter().zip(actions) {
+                match sdl2::keyboard::Keycode::from_name(name) {
+                    Some(k) => key_map.push((k, action)),
+                    None => {
+                        log!("Warning: unknown key name {:?} in --keys-to-dpad", name);
+                    }
+                }
+            }
+        }
+        let key_link = match &options.gamekit_link {
+            Some(crate::options::GameKitLink::Host(port)) => {
+                std::net::UdpSocket::bind(("0.0.0.0", port.wrapping_add(1)))
+                    .ok()
+                    .map(|socket| KeyLink { socket, peer: None })
+            }
+            Some(crate::options::GameKitLink::Join(addr)) => {
+                std::net::UdpSocket::bind(("0.0.0.0", 0)).ok().map(|socket| {
+                    let mut peer = *addr;
+                    peer.set_port(addr.port().wrapping_add(1));
+                    let _ = socket.send_to(b"H:", peer);
+                    KeyLink {
+                        socket,
+                        peer: Some(peer),
+                    }
+                })
+            }
+            None => None,
+        };
+        if let Some(link) = &key_link {
+            let _ = link.socket.set_nonblocking(true);
+        }
+        let mut ctx_key_taps = Vec::new();
+        for (i, t) in options.context_taps.iter().enumerate() {
+            if let Some(name) = &t.key {
+                match sdl2::keyboard::Keycode::from_name(name) {
+                    Some(k) => ctx_key_taps.push((i, k)),
+                    None => {
+                        log!("Warning: unknown key name {:?} in --context-key", name);
+                    }
+                }
+            }
+        }
+        let ctx_confirm_keys: Vec<_> = options
+            .menu_confirm_keys
+            .iter()
+            .filter_map(|n| sdl2::keyboard::Keycode::from_name(n))
+            .collect();
+        let ctx_back_keys: Vec<_> = options
+            .menu_back_keys
+            .iter()
+            .filter_map(|n| sdl2::keyboard::Keycode::from_name(n))
+            .collect();
+
+        // SDL2 disables the screen saver by default, but iPhone OS enables
+        // the idle timer that triggers sleep by default, so we turn it back on
+        // here, and then the app can disable it if it wants to.
+        video_ctx.enable_screen_saver();
+
+        let scale_hack = options.scale_hack;
+        // TODO: some apps specify their orientation in Info.plist, we could use
+        // that here.
+        let device_family = options.device_family.unwrap_or(DeviceFamily::iPhone);
+        let device_orientation = options.initial_orientation;
+        let fullscreen = options.fullscreen;
+
+        let mut window = if Self::rotatable_fullscreen() {
+            // Without this, SDL will force fullscreen mode to be portrait.
+            set_sdl2_orientation(device_orientation);
+            let screen_size = video_ctx.display_bounds(0).unwrap().size();
+            let (width, height) = rotate_fullscreen_size(device_orientation, screen_size);
+            let window = video_ctx
+                .window(title, width, height)
+                .fullscreen()
+                .opengl()
+                .build()
+                .unwrap();
+            window
+        } else if fullscreen {
+            let (width, height) = video_ctx.display_bounds(0).unwrap().size();
+            let window = video_ctx
+                .window(title, width, height)
+                .fullscreen_desktop()
+                .opengl()
+                .build()
+                .unwrap();
+            window
+        } else {
+            let (width, height) =
+                size_for_orientation(device_family, device_orientation, scale_hack);
+            // Local: --window-scale and a resizable window (the picture is
+            // letterboxed to whatever size the window has).
+            let (width, height) = (
+                (width as f32 * options.window_scale).round() as u32,
+                (height as f32 * options.window_scale).round() as u32,
+            );
+            let window = video_ctx
+                .window(title, width, height)
+                .position_centered()
+                .resizable()
+                .opengl()
+                .build()
+                .unwrap();
+            window
+        };
+
+        if env::consts::OS == "android" {
+            // Sanity check
+            let gl_attr = video_ctx.gl_attr();
+            debug_assert_eq!(gl_attr.context_profile(), sdl2::video::GLProfile::GLES);
+            debug_assert_eq!(gl_attr.context_version(), (1, 1));
+        }
+
+        if let Some(icon) = icon {
+            window.set_icon(surface_from_image(&icon));
+        }
+
+        let event_pump = sdl_ctx.event_pump().unwrap();
+
+        let controller_ctx = sdl_ctx.game_controller().unwrap();
+
+        let sensor_ctx = sdl_ctx.sensor().unwrap();
+        let mut accelerometer: Option<sdl2::sensor::Sensor> = None;
+        if let Ok(num_sensors) = sensor_ctx.num_sensors() {
+            for sensor_idx in 0..num_sensors {
+                if let Ok(sensor) = sensor_ctx.open(sensor_idx) {
+                    if sensor.sensor_type() == sdl2::sensor::SensorType::Accelerometer {
+                        log!("Accelerometer detected: {}.", sensor.name());
+                        accelerometer = Some(sensor);
+                        break;
+                    }
+                }
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        let max_height = window.size().1;
+
+        let mut window = Window {
+            _sdl_ctx: sdl_ctx,
+            video_ctx,
+            window,
+            event_pump,
+            event_queue: VecDeque::new(),
+            last_polled: Instant::now() - Duration::from_secs(1),
+            high_priority_event: None,
+            enable_event_polling: true,
+            #[cfg(target_os = "macos")]
+            max_height,
+            #[cfg(target_os = "macos")]
+            viewport_y_offset: 0,
+            fullscreen,
+            scale_hack,
+            internal_gl_ins: None,
+            splash_image: launch_image,
+            device_family,
+            device_orientation,
+            controller_ctx,
+            controllers: Vec::new(),
+            dpad_state: DpadState {
+                left: false,
+                right: false,
+                up: false,
+                down: false,
+                active: false,
+            },
+            stick_active: false,
+            key_map,
+            keys_down: std::collections::HashSet::new(),
+            key_link,
+            controller_choice: options.controller_index,
+            context: Vec::new(),
+            ctx_held: HashMap::new(),
+            ctx_swallowed: std::collections::HashSet::new(),
+            menu_sel: None,
+            menu_pointer: None,
+            menu_ctx_active: false,
+            list_state: None,
+            list_menu: None,
+            list_busy_until: None,
+            combo: ComboState::default(),
+            triggers_down: [false; 2],
+            plates: Vec::new(),
+            plates_seen: Vec::new(),
+            plate_sel: None,
+            plate_user_moved: false,
+            plate_nav_was_active: false,
+            move_touch_last: HashMap::new(),
+            cursor_last_aim: None,
+            plate_followup: None,
+            pending_ups: Vec::new(),
+            ctx_key_taps,
+            ctx_confirm_keys,
+            ctx_back_keys,
+            _sensor_ctx: sensor_ctx,
+            accelerometer,
+            virtual_cursor_last: None,
+            virtual_cursor_last_unsticky: None,
+            virtual_accelerometer_last: None,
+            on_main_stack: true,
+        };
+
+        // Set up OpenGL ES context used for splash screen and app UI rendering
+        // (see src/frameworks/core_animation/composition.rs). OpenGL ES is used
+        // because SDL2 won't let us use more than one graphics API in the same
+        // window, and we also need OpenGL ES for the app's own rendering.
+        let mut gl_ins = create_gles1_ctx_no_parent_stack(&mut window, options);
+        {
+            let gl_ctx = gl_ins.make_current(&mut window);
+            log!("Driver info: {}", unsafe { gl_ctx.driver_description() });
+        }
+        window.internal_gl_ins = Some(gl_ins);
+
+        if window.splash_image.is_some() {
+            window.display_splash();
+        }
+
+        window
+    }
+
+    /// Poll for events from the OS. This needs to be done reasonably often
+    /// (60Hz is probably fine) so that the host OS doesn't consider touchHLE
+    /// to be unresponsive. Note that events are not returned by this function,
+    /// since we often need to defer actually handling them.
+    ///
+    /// Since polling can be quite expensive, this function will skip it if it
+    /// was called too recently.
+    pub fn poll_for_events(&mut self, options: &Options) {
+        self.poll_for_events_inner(options);
+        self.combo_process(options);
+    }
+
+    fn poll_for_events_inner(&mut self, options: &Options) {
+        assert!(self.on_main_stack);
+        let now = Instant::now();
+        // poll roughly twice per frame to try to avoid missing frames sometimes
+        if now.duration_since(self.last_polled) < Duration::from_secs_f64(1.0 / 120.0) {
+            return;
+        }
+        self.last_polled = now;
+
+        fn transform_input_coords(
+            window: &Window,
+            (in_x, in_y): (f32, f32),
+            independent_of_viewport: bool,
+        ) -> (f32, f32) {
+            let (vx, vy, vw, vh) = if independent_of_viewport {
+                let (width, height) = size_for_orientation(
+                    window.device_family,
+                    window.device_orientation,
+                    NonZeroU32::new(1).unwrap(),
+                );
+                (0, 0, width, height)
+            } else {
+                window.viewport()
+            };
+            // normalize to unit square centred on origin
+            let x = (in_x - vx as f32) / vw as f32 - 0.5;
+            let y = (in_y - vy as f32) / vh as f32 - 0.5;
+            // rotate
+            let matrix = window.rotation_matrix().inverse().unwrap();
+            let [x, y] = matrix.transform([x, y]);
+            // back to pixels
+            let (out_w, out_h) = window.size_unrotated_unscaled();
+            let out_x = (x + 0.5) * out_w as f32;
+            let out_y = (y + 0.5) * out_h as f32;
+            // Round to match touch precision of official devices.
+            (out_x.round(), out_y.round())
+        }
+        fn transform_virt_accel_coords(window: &Window, (in_x, in_y): (i32, i32)) -> (f32, f32) {
+            let (_, _, vw, vh) = window.viewport();
+            let out_x = ((in_x as f32 / vw as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            let out_y = ((in_y as f32 / vh as f32) * 2.0 - 1.0).clamp(-1.0, 1.0);
+            (out_x, out_y)
+        }
+        fn translate_button(button: sdl2::controller::Button) -> Option<crate::options::Button> {
+            match button {
+                sdl2::controller::Button::DPadLeft => Some(crate::options::Button::DPadLeft),
+                sdl2::controller::Button::DPadUp => Some(crate::options::Button::DPadUp),
+                sdl2::controller::Button::DPadRight => Some(crate::options::Button::DPadRight),
+                sdl2::controller::Button::DPadDown => Some(crate::options::Button::DPadDown),
+                sdl2::controller::Button::Start => Some(crate::options::Button::Start),
+                sdl2::controller::Button::A => Some(crate::options::Button::A),
+                sdl2::controller::Button::B => Some(crate::options::Button::B),
+                sdl2::controller::Button::X => Some(crate::options::Button::X),
+                sdl2::controller::Button::Y => Some(crate::options::Button::Y),
+                sdl2::controller::Button::LeftShoulder => {
+                    Some(crate::options::Button::LeftShoulder)
+                }
+                sdl2::controller::Button::RightShoulder => {
+                    Some(crate::options::Button::RightShoulder)
+                }
+                sdl2::controller::Button::Back => Some(crate::options::Button::Back),
+                sdl2::controller::Button::LeftStick => Some(crate::options::Button::LeftStick),
+                sdl2::controller::Button::RightStick => Some(crate::options::Button::RightStick),
+                _ => None,
+            }
+        }
+        fn finger_absolute_coords(window: &Window, (x, y): (f32, f32)) -> (f32, f32) {
+            let (screen_width, screen_height) = window.window.drawable_size();
+            (screen_width as f32 * x, screen_height as f32 * y)
+        }
+
+        let mut controller_updated = false;
+
+        // Local: keys forwarded from the linked instance.
+        let mut forwarded = Vec::new();
+        if let Some(link) = &mut self.key_link {
+            let mut buf = [0u8; 128];
+            while let Ok((n, from)) = link.socket.recv_from(&mut buf) {
+                link.peer = Some(from);
+                if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                    if let Some(name) = s.strip_prefix("D:") {
+                        forwarded.push((name.to_string(), true));
+                    } else if let Some(name) = s.strip_prefix("U:") {
+                        forwarded.push((name.to_string(), false));
+                    }
+                }
+            }
+        }
+        // Local: second tap for buttons that only highlighted on the first.
+        if let Some((due, at, was_highlighted)) = self.plate_followup {
+            if Instant::now() >= due {
+                self.plate_followup = None;
+                let still_waiting = self
+                    .plates
+                    .iter()
+                    .find(|p| (p.cx - at.0).hypot(p.cy - at.1) < 3.0)
+                    .is_some_and(|p| p.flags & 0x100 != 0 && p.flags & 0x2000 == 0);
+                if !was_highlighted && still_waiting {
+                    let evs = self.tap_events(at);
+                    self.event_queue.extend(evs);
+                }
+            }
+        }
+
+        // Local: delayed releases for screen-menu taps.
+        let now = Instant::now();
+        let mut i = 0;
+        while i < self.pending_ups.len() {
+            if self.pending_ups[i].0 <= now {
+                let (_, ev) = self.pending_ups.remove(i);
+                self.event_queue.push_back(ev);
+            } else {
+                i += 1;
+            }
+        }
+
+        for (name, pressed) in forwarded {
+            if let Some(k) = sdl2::keyboard::Keycode::from_name(&name) {
+                if let Some(evs) = self.context_input(options, CtxInput::Key(k), pressed) {
+                    self.event_queue.extend(evs);
+                    continue;
+                }
+                if let Some(ev) = self.handle_mapped_key(options, k, pressed) {
+                    self.event_queue.push_back(ev);
+                }
+            }
+        }
+
+        // event_pump doesn't have a method to peek on events
+        // so, we keep track of an unconsumed one from a previous loop iteration
+        // FIXME: use peek_event() from even_subsystem
+        let mut previous_event: Option<sdl2::event::Event> = None;
+        while self.enable_event_polling {
+            use sdl2::event::Event as E;
+            let event = if let Some(e) = previous_event.take() {
+                match e {
+                    E::Unknown { .. } => (),
+                    _ => log_dbg!("Consuming previous event: {:?}", e),
+                }
+                e
+            } else if let Some(e) = self.event_pump.poll_event() {
+                match e {
+                    E::Unknown { .. } => (),
+                    _ => log_dbg!("Consuming new event: {:?}", e),
+                }
+                e
+            } else {
+                break;
+            };
+
+            // Virtual accelerometer
+            match event {
+                E::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } => {
+                    let (x, y) = transform_virt_accel_coords(self, (x, y));
+                    self.virtual_accelerometer_last = Some((x, y, true));
+                }
+                E::MouseMotion {
+                    x, y, mousestate, ..
+                } if mousestate.right() => {
+                    let (x, y) = transform_virt_accel_coords(self, (x, y));
+                    self.virtual_accelerometer_last = Some((x, y, true));
+                }
+                E::MouseButtonUp {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Right,
+                    ..
+                } => {
+                    let (x, y) = transform_virt_accel_coords(self, (x, y));
+                    self.virtual_accelerometer_last = Some((x, y, false));
+                }
+                _ => {}
+            }
+
+            // Local: keyboard-to-touch mapping and key forwarding.
+            match event {
+                E::KeyDown {
+                    keycode: Some(k),
+                    repeat: false,
+                    ..
+                }
+                | E::KeyUp {
+                    keycode: Some(k),
+                    repeat: false,
+                    ..
+                } => {
+                    let pressed = matches!(event, E::KeyDown { .. });
+                    if let Some(link) = &self.key_link {
+                        if let Some(peer) = link.peer {
+                            let msg = format!("{}:{}", if pressed { "D" } else { "U" }, k.name());
+                            let _ = link.socket.send_to(msg.as_bytes(), peer);
+                        }
+                    }
+                    if let Some(evs) = self.context_input(options, CtxInput::Key(k), pressed) {
+                        self.event_queue.extend(evs);
+                        continue;
+                    }
+                    if self.key_map.iter().any(|(mk, _)| *mk == k) {
+                        if let Some(ev) = self.handle_mapped_key(options, k, pressed) {
+                            self.event_queue.push_back(ev);
+                        }
+                        continue;
+                    }
+                }
+                E::KeyDown {
+                    keycode: Some(k),
+                    repeat: true,
+                    ..
+                } if self.key_map.iter().any(|(mk, _)| *mk == k) => continue,
+                E::ControllerButtonDown { button, .. } | E::ControllerButtonUp { button, .. } => {
+                    if let Some(b) = translate_button(button) {
+                        let pressed = matches!(event, E::ControllerButtonDown { .. });
+                        if let Some(evs) = self.context_input(options, CtxInput::Button(b), pressed) {
+                            controller_updated = true;
+                            self.event_queue.extend(evs);
+                            continue;
+                        }
+                    }
+                }
+                E::ControllerAxisMotion {
+                    axis: axis @ (sdl2::controller::Axis::TriggerLeft | sdl2::controller::Axis::TriggerRight),
+                    value,
+                    ..
+                } => {
+                    // Local: triggers act as buttons (press past half way).
+                    let (i, b) = if axis == sdl2::controller::Axis::TriggerLeft {
+                        (0, crate::options::Button::LeftTrigger)
+                    } else {
+                        (1, crate::options::Button::RightTrigger)
+                    };
+                    let was = self.triggers_down[i];
+                    let pressed = if was { value > 8000 } else { value > 16000 };
+                    if pressed == was {
+                        continue;
+                    }
+                    self.triggers_down[i] = pressed;
+                    controller_updated = true;
+                    if let Some(evs) = self.context_input(options, CtxInput::Button(b), pressed) {
+                        self.event_queue.extend(evs);
+                        continue;
+                    }
+                    if let Some(&(x, y)) = options.button_to_touch.get(&b) {
+                        let coords = transform_input_coords(self, (x, y), true);
+                        let m = HashMap::from([(FingerId::ButtonToTouch(b), coords)]);
+                        self.event_queue.push_back(if pressed {
+                            Event::TouchesDown(m)
+                        } else {
+                            Event::TouchesUp(m)
+                        });
+                    }
+                    continue;
+                }
+                E::ControllerAxisMotion {
+                    axis: sdl2::controller::Axis::LeftX | sdl2::controller::Axis::LeftY,
+                    ..
+                } if self.in_menu_context(options) => {
+                    controller_updated = true;
+                    self.release_movement_touches();
+                    continue;
+                }
+                _ => {}
+            }
+
+            self.event_queue.push_back(match event {
+                E::Quit { .. } => Event::Quit,
+                E::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
+                    Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
+                }
+                E::MouseMotion {
+                    x, y, mousestate, ..
+                } if mousestate.left() => {
+                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    log_dbg!("MouseMotion x {}, y {}, coords {:?}", x, y, coords);
+                    Event::TouchesMove(HashMap::from([(FingerId::Mouse, coords)]))
+                }
+                E::MouseButtonUp {
+                    x,
+                    y,
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    let coords = transform_input_coords(self, (x as f32, y as f32), false);
+                    log_dbg!("MouseButtonUp x {}, y {}, coords {:?}", x, y, coords);
+                    Event::TouchesUp(HashMap::from([(FingerId::Mouse, coords)]))
+                }
+                E::ControllerDeviceAdded { which, .. } => {
+                    self.controller_added(which);
+                    continue;
+                }
+                E::ControllerDeviceRemoved { which, .. } => {
+                    self.controller_removed(which);
+                    continue;
+                }
+                // Note that accelerometer simulation with analog sticks is
+                // handled with polling, rather than being event-based.
+                E::ControllerButtonUp { button, .. } | E::ControllerButtonDown { button, .. } => {
+                    controller_updated = true;
+                    let Some(button) = translate_button(button) else {
+                        continue;
+                    };
+                    // Called whenever a DPad direction is pressed or released
+                    if (button == crate::options::Button::DPadLeft
+                        || button == crate::options::Button::DPadUp
+                        || button == crate::options::Button::DPadRight
+                        || button == crate::options::Button::DPadDown)
+                        && options.dpad_to_touch.is_some()
+                    {
+                        let Some((x, y, w, h)) = options.dpad_to_touch else {
+                            unreachable!();
+                        };
+
+                        // Update held state
+                        let pressed = matches!(event, E::ControllerButtonDown { .. });
+                        match button {
+                            crate::options::Button::DPadLeft => self.dpad_state.left = pressed,
+                            crate::options::Button::DPadRight => self.dpad_state.right = pressed,
+                            crate::options::Button::DPadUp => self.dpad_state.up = pressed,
+                            crate::options::Button::DPadDown => self.dpad_state.down = pressed,
+                            _ => unreachable!(),
+                        }
+
+                        // Compute center
+                        let cx = x + w * 0.5;
+                        let cy = y + h * 0.5;
+
+                        // Compute combined delta
+                        let mut dx = 0.0;
+                        let mut dy = 0.0;
+
+                        if self.dpad_state.left {
+                            dx -= 0.5 * w;
+                        }
+                        if self.dpad_state.right {
+                            dx += 0.5 * w;
+                        }
+                        if self.dpad_state.up {
+                            dy -= 0.5 * h;
+                        }
+                        if self.dpad_state.down {
+                            dy += 0.5 * h;
+                        }
+
+                        // Final coords: center + movement
+                        let coords = transform_input_coords(self, (cx + dx, cy + dy), true);
+
+                        // Send TouchDown if any dpad is held, TouchUp if none
+                        let any_held = self.dpad_state.left
+                            || self.dpad_state.right
+                            || self.dpad_state.up
+                            || self.dpad_state.down;
+
+                        if !self.dpad_state.active && any_held {
+                            // New touch
+                            self.dpad_state.active = true;
+                            Event::TouchesDown(HashMap::from([(FingerId::DpadToTouch, coords)]))
+                        } else if self.dpad_state.active && any_held {
+                            // Move existing touch
+                            Event::TouchesMove(HashMap::from([(FingerId::DpadToTouch, coords)]))
+                        } else if self.dpad_state.active && !any_held {
+                            // Release touch
+                            self.dpad_state.active = false;
+                            Event::TouchesUp(HashMap::from([(FingerId::DpadToTouch, coords)]))
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        let Some(&(x, y)) = options.button_to_touch.get(&button) else {
+                            if matches!(event, E::ControllerButtonDown { .. }) {
+                                log!("Controller button {:?} pressed, but nothing is bound to it.", button);
+                            }
+                            continue;
+                        };
+                        match event {
+                            E::ControllerButtonUp { .. } => {
+                                let coords = transform_input_coords(self, (x, y), true);
+                                Event::TouchesUp(HashMap::from([(
+                                    FingerId::ButtonToTouch(button),
+                                    coords,
+                                )]))
+                            }
+                            E::ControllerButtonDown { .. } => {
+                                let coords = transform_input_coords(self, (x, y), true);
+                                Event::TouchesDown(HashMap::from([(
+                                    FingerId::ButtonToTouch(button),
+                                    coords,
+                                )]))
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                E::ControllerAxisMotion { axis, .. } => {
+                    controller_updated = true;
+                    let Some((x, y, w, h)) = options.stick_to_touch else {
+                        continue;
+                    };
+                    if axis == sdl2::controller::Axis::LeftX
+                        || axis == sdl2::controller::Axis::LeftY
+                    {
+                        let (stick_x, stick_y, _) = self.get_controller_stick(options, true);
+                        let coords = transform_input_coords(
+                            self,
+                            (
+                                x + ((stick_x + 1.0) / 2.0) * w,
+                                y + ((stick_y + 1.0) / 2.0) * h,
+                            ),
+                            true,
+                        );
+                        if stick_x.abs() < options.deadzone && stick_y.abs() < options.deadzone {
+                            if !self.stick_active {
+                                // Ignore deadzone events when stick is inactive
+                                continue;
+                            } else {
+                                // Release touch when stick returns to deadzone
+                                self.stick_active = false;
+                                Event::TouchesUp(HashMap::from([(FingerId::StickToTouch, coords)]))
+                            }
+                        } else if !self.stick_active {
+                            // New touch
+                            self.stick_active = true;
+                            Event::TouchesDown(HashMap::from([(FingerId::StickToTouch, coords)]))
+                        } else {
+                            // Move existing touch
+                            Event::TouchesMove(HashMap::from([(FingerId::StickToTouch, coords)]))
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                E::AppWillEnterBackground { .. } => {
+                    log!("Received app-will-resign-active event.");
+                    assert!(self.high_priority_event.is_none());
+                    self.high_priority_event = Some(Event::AppWillResignActive);
+                    // For some reason, if we don't pause event polling, we will
+                    // never finish handling the event.
+                    // TODO: Add a mechanism for re-enabling polling, if at some
+                    // point we support returning touchHLE to the foreground.
+                    self.enable_event_polling = false;
+                    continue;
+                }
+                E::AppTerminating { .. } => {
+                    log!("Received app-will-terminate event.");
+                    assert!(self.high_priority_event.is_none());
+                    self.high_priority_event = Some(Event::AppWillTerminate);
+                    self.enable_event_polling = false;
+                    continue;
+                }
+                E::FingerUp {
+                    timestamp,
+                    finger_id,
+                    x,
+                    y,
+                    ..
+                }
+                | E::FingerMotion {
+                    timestamp,
+                    finger_id,
+                    x,
+                    y,
+                    ..
+                }
+                | E::FingerDown {
+                    timestamp,
+                    finger_id,
+                    x,
+                    y,
+                    ..
+                } => {
+                    log_dbg!("Starting multi-touch for {:?}", event);
+                    // To implement multi-touch we accumulate here same touch
+                    // events at the same timestamp. This is consistent with
+                    // UIKit, but could be broken if events come out of order.
+                    // (in worst case we separate multi-touches in several ones)
+                    // TODO: handle out of order touches
+                    let curr_timestamp = timestamp;
+                    let abs_coords = finger_absolute_coords(self, (x, y));
+                    let coords = transform_input_coords(self, abs_coords, false);
+                    log_dbg!("Finger event x {}, y {}, coords {:?}", x, y, coords);
+                    let mut map = HashMap::from([(FingerId::Touch(finger_id), coords)]);
+                    while let Some(next) = self.event_pump.poll_event() {
+                        match next {
+                            E::Unknown { .. } => (),
+                            _ => log_dbg!("Next possible multi-touch event: {:?}", next),
+                        }
+                        match next {
+                            E::FingerUp {
+                                timestamp,
+                                finger_id,
+                                x,
+                                y,
+                                ..
+                            }
+                            | E::FingerMotion {
+                                timestamp,
+                                finger_id,
+                                x,
+                                y,
+                                ..
+                            }
+                            | E::FingerDown {
+                                timestamp,
+                                finger_id,
+                                x,
+                                y,
+                                ..
+                            } if timestamp == curr_timestamp && next.is_same_kind_as(&event) => {
+                                let abs_coords = finger_absolute_coords(self, (x, y));
+                                let coords = transform_input_coords(self, abs_coords, false);
+                                map.insert(FingerId::Touch(finger_id), coords);
+                            }
+                            E::MultiGesture { timestamp, .. } if timestamp == curr_timestamp => {
+                                // TODO: handle gestures
+                                continue;
+                            }
+                            _ => {
+                                // event_pump doesn't have a method to peek on
+                                // events, so we keep track of an unconsumed
+                                // one from a previous loop iteration
+                                assert!(previous_event.is_none());
+                                previous_event = Some(next);
+                                break;
+                            }
+                        }
+                    }
+                    log_dbg!("Finishing multi-touch for {:?} with {:?}", event, map);
+                    match event {
+                        E::FingerUp { .. } => Event::TouchesUp(map),
+                        E::FingerMotion { .. } => Event::TouchesMove(map),
+                        E::FingerDown { .. } => Event::TouchesDown(map),
+                        _ => unreachable!(),
+                    }
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::F12),
+                    ..
+                } => {
+                    // Log this so you can tell when touchHLE has received
+                    // the event but it's stuck in the queue.
+                    echo!("F12 pressed, EnterDebugger event queued.");
+                    Event::EnterDebugger
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::Backspace),
+                    ..
+                } => {
+                    log_dbg!("SDL TextInput Backspace");
+                    Event::TextInput(TextInputEvent::Backspace)
+                }
+                E::KeyDown {
+                    keycode: Some(sdl2::keyboard::Keycode::Return),
+                    ..
+                } => {
+                    log_dbg!("SDL TextInput Return");
+                    Event::TextInput(TextInputEvent::Return)
+                }
+                E::TextInput { text, .. } => {
+                    log_dbg!("SDL TextInput {}", text);
+                    Event::TextInput(TextInputEvent::Text(text))
+                }
+                _ => continue,
+            })
+        }
+
+        // Local: remember where the movement fingers are, for clean releases.
+        for ev in self.event_queue.iter() {
+            match ev {
+                Event::TouchesDown(m) | Event::TouchesMove(m) => {
+                    for (f, c) in m {
+                        if matches!(f, FingerId::DpadToTouch | FingerId::StickToTouch) {
+                            self.move_touch_last.insert(*f, *c);
+                        }
+                    }
+                }
+                Event::TouchesUp(m) => {
+                    for f in m.keys() {
+                        self.move_touch_last.remove(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if controller_updated {
+            let (new_x, new_y, pressed, pressed_changed, moved) =
+                self.update_virtual_cursor(options);
+            self.event_queue
+                .push_back(match (pressed, pressed_changed, moved) {
+                    (true, true, _) => {
+                        let coords = transform_input_coords(self, (new_x, new_y), false);
+                        Event::TouchesDown(HashMap::from([(FingerId::VirtualCursor, coords)]))
+                    }
+                    (false, true, _) => {
+                        let coords = transform_input_coords(self, (new_x, new_y), false);
+                        Event::TouchesUp(HashMap::from([(FingerId::VirtualCursor, coords)]))
+                    }
+                    (true, _, true) => {
+                        let coords = transform_input_coords(self, (new_x, new_y), false);
+                        Event::TouchesMove(HashMap::from([(FingerId::VirtualCursor, coords)]))
+                    }
+                    _ => return,
+                });
+        }
+    }
+
+    /// Local: the game coordinates a button finger presses, if any.
+    fn finger_target(&self, options: &Options, f: FingerId) -> Option<(f32, f32)> {
+        match f {
+            FingerId::ButtonToTouch(b) => options.button_to_touch.get(&b).copied(),
+            FingerId::KeyToTouch(i) => self.key_map.iter().find_map(|(_, a)| match *a {
+                KeyAction::Touch(j, x, y) if j == i => Some((x, y)),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Local: game-coordinate rectangle of a movement finger's control.
+    fn move_rect(&self, options: &Options, f: FingerId) -> Option<(f32, f32, f32, f32)> {
+        match f {
+            FingerId::DpadToTouch => options.dpad_to_touch,
+            FingerId::StickToTouch => options.stick_to_touch,
+            _ => None,
+        }
+    }
+
+    /// Local: the held movement finger and its direction as (x, y) in -1..1
+    /// relative to its control (y negative = up).
+    fn held_direction(&self, options: &Options) -> Option<(FingerId, Coords, f32, f32)> {
+        for f in [FingerId::DpadToTouch, FingerId::StickToTouch] {
+            let Some(&p) = self.move_touch_last.get(&f) else {
+                continue;
+            };
+            let (x, y, w, h) = self.move_rect(options, f)?;
+            let c = transform_input_coords_mapped(self, (x + w / 2.0, y + h / 2.0), true);
+            let r = transform_input_coords_mapped(self, (x + w, y + h / 2.0), true);
+            let d = transform_input_coords_mapped(self, (x + w / 2.0, y + h), true);
+            let v = (p.0 - c.0, p.1 - c.1);
+            let ax = (r.0 - c.0, r.1 - c.1);
+            let ay = (d.0 - c.0, d.1 - c.1);
+            let dot = |a: (f32, f32), b: (f32, f32)| a.0 * b.0 + a.1 * b.1;
+            let dx = dot(v, ax) / dot(ax, ax).max(1e-6);
+            let dy = dot(v, ay) / dot(ay, ay).max(1e-6);
+            return Some((f, p, dx, dy));
+        }
+        None
+    }
+
+    /// Local: where to put a movement finger to point up (-1) or down (1).
+    fn vertical_point(&self, options: &Options, f: FingerId, dir: f32) -> Option<Coords> {
+        let (x, y, w, h) = self.move_rect(options, f).or(options.dpad_to_touch).or(options.stick_to_touch)?;
+        let gy = y + h / 2.0 + dir * h * 0.45;
+        Some(transform_input_coords_mapped(self, (x + w / 2.0, gy), true))
+    }
+
+    /// Local: classic-combo filter. Runs over events the poll just queued:
+    /// - left/right + D becomes up + D (headbutt in the older games);
+    /// - jump + punch together becomes down + D (back elbow).
+    fn combo_process(&mut self, options: &Options) {
+        let headbutt = options.classic_headbutt;
+        let elbow = options.classic_elbow;
+        if headbutt.is_none() && elbow.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let near = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() < 1.0 && (a.1 - b.1).abs() < 1.0;
+
+        // Split new events into single-finger events and filter them.
+        let new: Vec<Event> = self.event_queue.drain(self.combo.filtered.min(self.event_queue.len())..).collect();
+        let mut out: Vec<Event> = Vec::new();
+        for ev in new {
+            let (kind, map) = match ev {
+                Event::TouchesDown(m) => (0, m),
+                Event::TouchesMove(m) => (1, m),
+                Event::TouchesUp(m) => (2, m),
+                other => {
+                    out.push(other);
+                    continue;
+                }
+            };
+            for (f, c) in map {
+                let mk = |k: u8, f: FingerId, c: Coords| {
+                    let m = HashMap::from([(f, c)]);
+                    match k {
+                        0 => Event::TouchesDown(m),
+                        1 => Event::TouchesMove(m),
+                        _ => Event::TouchesUp(m),
+                    }
+                };
+                // The movement finger is held in place during a combo.
+                if let Some(h) = &mut self.combo.hold {
+                    if h.finger == f && !matches!(f, FingerId::Combo(_)) {
+                        h.real = if kind == 2 { None } else { Some(c) };
+                        continue;
+                    }
+                    if h.synthetic && kind == 0 && matches!(f, FingerId::DpadToTouch | FingerId::StickToTouch) {
+                        // Real movement started while a made-up finger is
+                        // down: take it over.
+                        h.real = Some(c);
+                        h.finger = f;
+                        h.synthetic = false;
+                        out.push(mk(2, FingerId::Combo(0), h.forced));
+                        out.push(mk(0, f, h.forced));
+                        continue;
+                    }
+                    if h.triggers.contains(&f) && kind == 2 {
+                        if !h.released {
+                            h.released = true;
+                            let t = now.max(h.button_down_at + Duration::from_millis(100));
+                            let (bf, bc) = h.button;
+                            self.combo.pending.push((t, mk(2, bf, bc)));
+                        }
+                        self.combo.swallow_up.remove(&f);
+                        continue;
+                    }
+                }
+                if kind == 2 && self.combo.swallow_up.remove(&f) {
+                    continue;
+                }
+                let target = self.finger_target(options, f);
+                let role_d_head = headbutt.zip(target).is_some_and(|(a, t)| near(a, t));
+                let role_jump = elbow.zip(target).is_some_and(|(e, t)| near(e[0], t));
+                let role_punch = elbow.zip(target).is_some_and(|(e, t)| near(e[1], t));
+
+                if kind == 0 && role_d_head && self.combo.hold.is_none() {
+                    if let Some((mf, p, dx, dy)) = self.held_direction(options) {
+                        if dx.abs() <= 0.3 && dy.abs() > 0.3 {
+                            // Classic: up/down + D is a plain D. Lift the
+                            // movement finger while D is pressed.
+                            if std::env::var("TOUCHHLE_COMBO_DEBUG").is_ok() {
+                                log!("Combo: up/down+D -> D");
+                            }
+                            out.push(mk(2, mf, p));
+                            let t = now + Duration::from_millis(80);
+                            self.combo.pending.push((t, mk(0, f, c)));
+                            self.combo.hold = Some(ComboHold {
+                                finger: mf,
+                                real: Some(p),
+                                forced: p,
+                                synthetic: false,
+                                button: (f, c),
+                                button_down_at: t,
+                                triggers: vec![f],
+                                released: false,
+                                lifted: true,
+                            });
+                            continue;
+                        }
+                        if dx.abs() > 0.3 {
+                            if let Some(up) = self.vertical_point(options, mf, -1.0) {
+                                if std::env::var("TOUCHHLE_COMBO_DEBUG").is_ok() {
+                                    log!("Combo: side+D -> up+D");
+                                }
+                                out.push(mk(1, mf, up));
+                                let t = now + Duration::from_millis(80);
+                                self.combo.pending.push((t, mk(0, f, c)));
+                                self.combo.hold = Some(ComboHold {
+                                    finger: mf,
+                                    real: Some(p),
+                                    forced: up,
+                                    synthetic: false,
+                                    button: (f, c),
+                                    button_down_at: t,
+                                    triggers: vec![f],
+                                    released: false,
+                                    lifted: false,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if (role_jump || role_punch) && self.combo.hold.is_none() {
+                    if kind == 0 {
+                        let partner = self.combo.buffered.filter(|(bf, _, t)| {
+                            *bf != f && now.duration_since(*t) < Duration::from_millis(70)
+                        });
+                        if let (Some((bf, _, _)), Some(e)) = (partner, elbow) {
+                            // Jump + punch: down + D.
+                            if std::env::var("TOUCHHLE_COMBO_DEBUG").is_ok() {
+                                log!("Combo: jump+punch -> down+D");
+                            }
+                            self.combo.buffered = None;
+                            let held = self.held_direction(options);
+                            let mf = held.map(|h| h.0).unwrap_or(FingerId::Combo(0));
+                            if let Some(down) = self.vertical_point(options, mf, 1.0) {
+                                if held.is_some() {
+                                    out.push(mk(1, mf, down));
+                                } else {
+                                    out.push(mk(0, mf, down));
+                                }
+                                let dc = transform_input_coords_mapped(self, e[2], true);
+                                let t = now + Duration::from_millis(80);
+                                self.combo.pending.push((t, mk(0, FingerId::Combo(1), dc)));
+                                // A short D tap, however long the buttons are held.
+                                self.combo.pending.push((t + Duration::from_millis(100), mk(2, FingerId::Combo(1), dc)));
+                                self.combo.swallow_up.insert(f);
+                                self.combo.swallow_up.insert(bf);
+                                self.combo.hold = Some(ComboHold {
+                                    finger: mf,
+                                    real: held.map(|h| h.1),
+                                    forced: down,
+                                    synthetic: held.is_none(),
+                                    button: (FingerId::Combo(1), dc),
+                                    button_down_at: t,
+                                    triggers: Vec::new(),
+                                    released: false,
+                                    lifted: false,
+                                });
+                                continue;
+                            }
+                        }
+                        if let Some((bf, bc, _)) = self.combo.buffered.take() {
+                            out.push(mk(0, bf, bc));
+                        }
+                        self.combo.buffered = Some((f, c, now));
+                        continue;
+                    } else if kind == 2 {
+                        if let Some((bf, bc, _)) = self.combo.buffered {
+                            if bf == f {
+                                // Quick tap released while held back.
+                                self.combo.buffered = None;
+                                out.push(mk(0, bf, bc));
+                                self.combo.pending.push((now + Duration::from_millis(70), mk(2, f, c)));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                out.push(mk(kind, f, c));
+            }
+        }
+
+        // Timers.
+        if let Some((bf, bc, t)) = self.combo.buffered {
+            if now.duration_since(t) >= Duration::from_millis(60) {
+                self.combo.buffered = None;
+                out.push(Event::TouchesDown(HashMap::from([(bf, bc)])));
+            }
+        }
+        let mut i = 0;
+        while i < self.combo.pending.len() {
+            if self.combo.pending[i].0 <= now {
+                out.push(self.combo.pending.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+        // The direction is only changed for about two game frames (so
+        // holding the buttons doesn't keep walking that way), except that a
+        // plain D keeps movement lifted until D is released.
+        let finished = self.combo.hold.as_ref().is_some_and(|h| {
+            (h.released || !h.lifted)
+                && now >= h.button_down_at + Duration::from_millis(140)
+                && !self.combo.pending.iter().any(|(_, e)| matches!(e, Event::TouchesUp(m) if m.contains_key(&h.button.0)))
+        });
+        if finished {
+            let h = self.combo.hold.take().unwrap();
+            if h.lifted {
+                if let Some(p) = h.real {
+                    out.push(Event::TouchesDown(HashMap::from([(h.finger, p)])));
+                }
+            } else {
+                out.push(match (h.synthetic, h.real) {
+                    (false, Some(p)) => Event::TouchesMove(HashMap::from([(h.finger, p)])),
+                    _ => Event::TouchesUp(HashMap::from([(h.finger, h.forced)])),
+                });
+            }
+        }
+        self.event_queue.extend(out);
+        self.combo.filtered = self.event_queue.len();
+    }
+
+    /// Pop an event from the queue (in FIFO order, except for high priority
+    /// events)
+    pub fn pop_event(&mut self) -> Option<Event> {
+        self.high_priority_event
+            .take()
+            .or_else(|| {
+                let ev = self.event_queue.pop_front();
+                if ev.is_some() {
+                    self.combo.filtered = self.combo.filtered.saturating_sub(1);
+                }
+                ev
+            })
+    }
+
+    /// Local: update the app "context" (screen state) read from guest memory.
+    pub fn set_context(&mut self, values: Vec<u32>, options: &Options) {
+        if values != self.context {
+            log!("Context: {:x?}", values);
+            self.context = values;
+            let was_menu = self.menu_ctx_active;
+            self.plate_user_moved = false;
+            self.plate_sel = None;
+            self.menu_sel = None;
+            self.menu_pointer = None;
+            self.menu_ctx_active = self.context.first().is_some_and(|ctx| {
+                options.context_menus.iter().any(|m| m.contexts.contains(ctx))
+                    || options.list_menus.iter().any(|m| m.contexts.contains(ctx))
+            });
+            self.list_state = self.context.first().and_then(|&ctx| {
+                options
+                    .list_menus
+                    .iter()
+                    .any(|m| m.contexts.contains(&ctx))
+                    .then_some((ctx, 0, 0, false))
+            });
+            self.list_menu = self.context.first().and_then(|&ctx| {
+                options.list_menus.iter().find(|m| m.contexts.contains(&ctx)).cloned()
+            });
+            if let Some(&ctx) = self.context.first() {
+                if let Some(m) = options
+                    .context_menus
+                    .iter()
+                    .find(|m| m.pointer && m.contexts.contains(&ctx))
+                {
+                    self.menu_sel = Some((ctx, 0));
+                    self.menu_pointer = Some(m.items[0]);
+                }
+            }
+            // Release movement touches when entering or leaving a menu screen,
+            // so nothing stays held there.
+            if was_menu != self.menu_ctx_active {
+                self.release_movement_touches();
+            }
+        }
+    }
+
+    /// Local: lift the simulated movement fingers (d-pad and left stick), so
+    /// none stays pressed when a menu screen stops listening to them. A stuck
+    /// finger makes single-touch screens ignore every new tap.
+    fn release_movement_touches(&mut self) {
+        if self.dpad_state.active {
+            self.dpad_state = DpadState {
+                left: false,
+                right: false,
+                up: false,
+                down: false,
+                active: false,
+            };
+            let c = self.move_touch_last.remove(&FingerId::DpadToTouch).unwrap_or((0.0, 0.0));
+            self.event_queue
+                .push_back(Event::TouchesUp(HashMap::from([(FingerId::DpadToTouch, c)])));
+        }
+        if self.stick_active {
+            self.stick_active = false;
+            let c = self.move_touch_last.remove(&FingerId::StickToTouch).unwrap_or((0.0, 0.0));
+            self.event_queue
+                .push_back(Event::TouchesUp(HashMap::from([(FingerId::StickToTouch, c)])));
+        }
+    }
+
+    /// Local: is d-pad navigation between the app's on-screen buttons active?
+    fn plate_nav_active(&self, options: &Options) -> bool {
+        let Some(&ctx) = self.context.first() else {
+            return false;
+        };
+        options.touch_plates
+            && !self.plates.is_empty()
+            && !options.plate_nav_exclude.contains(&ctx)
+            && !options.context_menus.iter().any(|m| m.contexts.contains(&ctx))
+            && !options.list_menus.iter().any(|m| m.contexts.contains(&ctx))
+    }
+
+    /// Local: update the app's current on-screen buttons. The app rebuilds
+    /// the list during each frame, so the fullest list from the last 150ms
+    /// is used.
+    pub fn set_plates(&mut self, plates: Vec<Plate>, options: &Options) {
+        let now = Instant::now();
+        self.plates_seen
+            .retain(|(t, _)| now.duration_since(*t) < Duration::from_millis(150));
+        self.plates_seen.push((now, plates));
+        let best = self
+            .plates_seen
+            .iter()
+            .max_by_key(|(t, p)| (p.len(), *t))
+            .map(|(_, p)| p.clone())
+            .unwrap_or_default();
+        let mut best = best;
+        if let Some(&ctx) = self.context.first() {
+            for (ctxs, items) in &options.extra_plates {
+                if ctxs.contains(&ctx) && !best.is_empty() {
+                    for (i, &[cx, cy, w, h]) in items.iter().enumerate() {
+                        best.push(Plate {
+                            cx,
+                            cy,
+                            w,
+                            h,
+                            flags: 0,
+                            num: 1000 + i as i32,
+                        });
+                    }
+                }
+            }
+        }
+        if std::env::var("TOUCHHLE_PLATE_DEBUG").is_ok() && best != self.plates {
+            log!("Plates ({:x?}): {:?}", self.context, best);
+        }
+        self.plates = best;
+        let nav_active = self.plate_nav_active(options);
+        if nav_active && !self.plate_nav_was_active {
+            self.release_movement_touches();
+        }
+        self.plate_nav_was_active = nav_active;
+        if nav_active {
+            if self.plate_user_moved
+                && self.plate_sel.and_then(|s| self.nearest_plate(s, 6.0)).is_none()
+            {
+                self.plate_user_moved = false;
+            }
+            let keep = if self.plate_user_moved { self.plate_sel } else { None };
+            let sel = keep
+                .and_then(|s| self.nearest_plate(s, 6.0))
+                .or_else(|| {
+                    self.plates
+                        .iter()
+                        .filter(|p| p.num >= 0)
+                        .min_by_key(|p| p.num)
+                        .or(self.plates.first())
+                        .map(|p| (p.cx, p.cy))
+                });
+            self.plate_sel = sel;
+            self.menu_pointer = sel;
+        } else if !self
+            .context
+            .first()
+            .is_some_and(|c| options.context_menus.iter().any(|m| m.pointer && m.contexts.contains(c)))
+        {
+            self.plate_sel = None;
+            self.menu_pointer = None;
+        }
+    }
+
+    fn nearest_plate(&self, (x, y): (f32, f32), max_dist: f32) -> Option<(f32, f32)> {
+        self.plates
+            .iter()
+            .map(|p| ((p.cx - x).hypot(p.cy - y), p))
+            .filter(|(d, _)| *d <= max_dist)
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, p)| (p.cx, p.cy))
+    }
+
+    fn plate_in_direction(&self, (x, y): (f32, f32), (dx, dy): (f32, f32)) -> Option<(f32, f32)> {
+        // Prefer buttons roughly in line with the pressed direction; if there
+        // are none, take the best one anywhere on that side of the screen.
+        let pick = |cone: bool| {
+            self.plates
+                .iter()
+                .filter_map(|p| {
+                    let (vx, vy) = (p.cx - x, p.cy - y);
+                    let along = vx * dx + vy * dy;
+                    let perp = (vx * dy - vy * dx).abs();
+                    if along > 4.0 && (!cone || perp <= along * 1.5) {
+                        Some((along + perp * 4.0, (p.cx, p.cy)))
+                    } else {
+                        None
+                    }
+                })
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, c)| c)
+        };
+        pick(true).or_else(|| pick(false))
+    }
+
+    fn in_menu_context(&self, options: &Options) -> bool {
+        let Some(&ctx) = self.context.first() else {
+            return false;
+        };
+        options.context_menus.iter().any(|m| m.contexts.contains(&ctx))
+            || self.plate_nav_active(options)
+    }
+
+    /// Local: screen-dependent handling of a button/key press or release.
+    /// Returns `None` if no screen rule applies (normal mapping is used).
+    fn context_input(&mut self, options: &Options, input: CtxInput, pressed: bool) -> Option<Vec<Event>> {
+        if !pressed {
+            if let Some((fid, c)) = self.ctx_held.remove(&input) {
+                return Some(vec![Event::TouchesUp(HashMap::from([(fid, c)]))]);
+            }
+            if self.ctx_swallowed.remove(&input) {
+                return Some(Vec::new());
+            }
+            return None;
+        }
+        let ctx = *self.context.first()?;
+
+        // Screen-specific tap for this button/key.
+        let tap_idx = options.context_taps.iter().enumerate().position(|(i, t)| {
+            t.contexts.contains(&ctx)
+                && match input {
+                    CtxInput::Button(b) => t.button == Some(b),
+                    CtxInput::Key(k) => self.ctx_key_taps.iter().any(|&(ti, tk)| ti == i && tk == k),
+                }
+        });
+        if let Some(i) = tap_idx {
+            let t = &options.context_taps[i];
+            let coords = transform_input_coords_mapped(self, (t.x, t.y), true);
+            let fid = FingerId::Context(i as u32);
+            self.ctx_held.insert(input, (fid, coords));
+            return Some(vec![Event::TouchesDown(HashMap::from([(fid, coords)]))]);
+        }
+
+        // Scrolling list of settings rows.
+        if let Some(lm) = options.list_menus.iter().find(|m| m.contexts.contains(&ctx)) {
+            return Some(self.list_menu_input(options, lm, ctx, input));
+        }
+
+        // Screen with a list of choices.
+        let Some(menu) = options.context_menus.iter().find(|m| m.contexts.contains(&ctx)) else {
+            return self.plate_nav_input(options, input);
+        };
+        let n = menu.items.len();
+        let dir: Option<i32> = match input {
+            CtxInput::Button(crate::options::Button::DPadUp | crate::options::Button::DPadLeft) => Some(-1),
+            CtxInput::Button(crate::options::Button::DPadDown | crate::options::Button::DPadRight) => Some(1),
+            CtxInput::Key(k) => match self.key_map.iter().find(|(mk, _)| *mk == k).map(|x| x.1) {
+                Some(KeyAction::DpadUp | KeyAction::DpadLeft) => Some(-1),
+                Some(KeyAction::DpadDown | KeyAction::DpadRight) => Some(1),
+                _ => None,
+            },
+            _ => None,
+        };
+        let confirm = match input {
+            CtxInput::Button(b) => options.menu_confirm_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_confirm_keys.contains(&k),
+        };
+        self.ctx_swallowed.insert(input);
+        let sel = match (dir, self.menu_sel) {
+            (Some(d), Some((c, i))) if c == ctx => (i as i32 + d).rem_euclid(n as i32) as usize,
+            (Some(d), _) => {
+                if d > 0 {
+                    0
+                } else {
+                    n - 1
+                }
+            }
+            (None, Some((c, i))) if c == ctx && confirm => i,
+            (None, _) if confirm => 0,
+            _ => return Some(Vec::new()),
+        };
+        self.menu_sel = Some((ctx, sel));
+        let (x, y) = menu.items[sel];
+        if menu.pointer {
+            self.menu_pointer = Some((x, y));
+            if !confirm {
+                return Some(Vec::new());
+            }
+        }
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_000);
+        self.pending_ups.push((
+            Instant::now() + Duration::from_millis(90),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+        Some(vec![Event::TouchesDown(HashMap::from([(fid, coords)]))])
+    }
+
+    /// Local: d-pad navigation between the app's on-screen buttons.
+    fn plate_nav_input(&mut self, options: &Options, input: CtxInput) -> Option<Vec<Event>> {
+        if !self.plate_nav_active(options) {
+            return None;
+        }
+        use crate::options::Button as B;
+        let dir: Option<(f32, f32)> = match input {
+            CtxInput::Button(B::DPadUp) => Some((0.0, -1.0)),
+            CtxInput::Button(B::DPadDown) => Some((0.0, 1.0)),
+            CtxInput::Button(B::DPadLeft) => Some((-1.0, 0.0)),
+            CtxInput::Button(B::DPadRight) => Some((1.0, 0.0)),
+            CtxInput::Key(k) => match self.key_map.iter().find(|(mk, _)| *mk == k).map(|x| x.1) {
+                Some(KeyAction::DpadUp) => Some((0.0, -1.0)),
+                Some(KeyAction::DpadDown) => Some((0.0, 1.0)),
+                Some(KeyAction::DpadLeft) => Some((-1.0, 0.0)),
+                Some(KeyAction::DpadRight) => Some((1.0, 0.0)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let confirm = match input {
+            CtxInput::Button(b) => options.menu_confirm_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_confirm_keys.contains(&k),
+        };
+        let back = match input {
+            CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
+        };
+        if back && !confirm && dir.is_none() {
+            self.ctx_swallowed.insert(input);
+            // The back arrow sits in the top-right corner of menu screens.
+            let target = self
+                .plates
+                .iter()
+                .filter(|p| (p.cx - 448.0).hypot(p.cy - 20.0) < 25.0)
+                .map(|p| (p.cx, p.cy))
+                .next();
+            return Some(target.map(|t| self.tap_events(t)).unwrap_or_default());
+        }
+        let is_mouse_free_input = dir.is_some() || confirm;
+        if !is_mouse_free_input {
+            // Other mapped buttons are ignored on menu screens, so they don't
+            // tap random spots.
+            self.ctx_swallowed.insert(input);
+            return Some(Vec::new());
+        }
+        self.ctx_swallowed.insert(input);
+        let cur = self.plate_sel?;
+        if let Some(d) = dir {
+            if let Some(next) = self.plate_in_direction(cur, d) {
+                self.plate_sel = Some(next);
+                self.menu_pointer = Some(next);
+                self.plate_user_moved = true;
+            }
+            return Some(Vec::new());
+        }
+        // Confirm: tap the selected button. If the app only highlights it,
+        // a follow-up tap is sent shortly after (see poll_for_events).
+        let was_highlighted = self
+            .plates
+            .iter()
+            .find(|p| (p.cx - cur.0).hypot(p.cy - cur.1) < 3.0)
+            .is_some_and(|p| p.flags & 0x100 != 0);
+        self.plate_followup = Some((Instant::now() + Duration::from_millis(220), cur, was_highlighted));
+        Some(self.tap_events(cur))
+    }
+
+    /// Local: d-pad input on a scrolling list menu.
+    fn list_menu_input(
+        &mut self,
+        options: &Options,
+        lm: &crate::options::ListMenu,
+        ctx: u32,
+        input: CtxInput,
+    ) -> Vec<Event> {
+        use crate::options::Button as B;
+        self.ctx_swallowed.insert(input);
+        let action = match input {
+            CtxInput::Key(k) => self.key_map.iter().find(|(mk, _)| *mk == k).map(|x| x.1),
+            _ => None,
+        };
+        let (up, down, side) = match input {
+            CtxInput::Button(b) => (b == B::DPadUp, b == B::DPadDown, matches!(b, B::DPadLeft | B::DPadRight)),
+            CtxInput::Key(_) => (
+                matches!(action, Some(KeyAction::DpadUp)),
+                matches!(action, Some(KeyAction::DpadDown)),
+                matches!(action, Some(KeyAction::DpadLeft | KeyAction::DpadRight)),
+            ),
+        };
+        let confirm = match input {
+            CtxInput::Button(b) => options.menu_confirm_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_confirm_keys.contains(&k),
+        };
+        let back = match input {
+            CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
+            CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
+        };
+        let (_, mut sel, mut scroll, tapped) = match self.list_state {
+            Some(s) if s.0 == ctx => s,
+            _ => (ctx, 0, 0, false),
+        };
+        let row_pos = |sel: usize, scroll: usize| (lm.x, list_row_y(lm, sel, scroll));
+        let mut evs = Vec::new();
+        // Wait out the list's scrolling animation (a touch would stop it).
+        if self.list_busy_until.is_some_and(|t| Instant::now() < t) {
+            return evs;
+        }
+        if up || down {
+            let new_sel = if up { sel.saturating_sub(1) } else { (sel + 1).min(lm.total - 1) };
+            if new_sel == sel && tapped {
+                return evs;
+            }
+            sel = new_sel;
+            let mut delay = 0;
+            if sel < scroll {
+                scroll = sel;
+                evs = self.hold_events(lm.up, 250);
+                delay = 750;
+            } else if sel >= scroll + lm.visible {
+                scroll = sel + 1 - lm.visible;
+                evs = self.hold_events(lm.down, 250);
+                delay = 750;
+            }
+            if delay > 0 {
+                self.list_busy_until = Some(Instant::now() + Duration::from_millis(delay + 120));
+            }
+            self.tap_later(row_pos(sel, scroll), delay, &mut evs);
+            self.list_state = Some((ctx, sel, scroll, true));
+        } else if side || confirm {
+            // The first tap only selects the row; the next changes it.
+            self.tap_later(row_pos(sel, scroll), 0, &mut evs);
+            if !tapped {
+                self.tap_later(row_pos(sel, scroll), 250, &mut evs);
+            }
+            self.list_state = Some((ctx, sel, scroll, true));
+        } else if back {
+            evs = self.tap_events(lm.back);
+        }
+        evs
+    }
+
+    /// Local: tap at game coords after `delay_ms` (0 = now, into `evs`).
+    fn tap_later(&mut self, (x, y): (f32, f32), delay_ms: u64, evs: &mut Vec<Event>) {
+        if delay_ms == 0 {
+            evs.extend(self.tap_events((x, y)));
+            return;
+        }
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_001);
+        let t = Instant::now() + Duration::from_millis(delay_ms);
+        self.pending_ups
+            .push((t, Event::TouchesDown(HashMap::from([(fid, coords)]))));
+        self.pending_ups.push((
+            t + Duration::from_millis(90),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+    }
+
+    /// Local: press at game coords now and release after `hold_ms`.
+    fn hold_events(&mut self, (x, y): (f32, f32), hold_ms: u64) -> Vec<Event> {
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_002);
+        self.pending_ups.push((
+            Instant::now() + Duration::from_millis(hold_ms),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+        vec![Event::TouchesDown(HashMap::from([(fid, coords)]))]
+    }
+
+    fn tap_events(&mut self, (x, y): (f32, f32)) -> Vec<Event> {
+        let coords = transform_input_coords_mapped(self, (x, y), true);
+        let fid = FingerId::Context(10_000);
+        self.pending_ups.push((
+            Instant::now() + Duration::from_millis(90),
+            Event::TouchesUp(HashMap::from([(fid, coords)])),
+        ));
+        vec![Event::TouchesDown(HashMap::from([(fid, coords)]))]
+    }
+
+    /// Local: apply a keyboard-to-touch mapping (local or forwarded key).
+    fn handle_mapped_key(
+        &mut self,
+        options: &Options,
+        key: sdl2::keyboard::Keycode,
+        pressed: bool,
+    ) -> Option<Event> {
+        let action = self.key_map.iter().find(|(k, _)| *k == key)?.1;
+        if std::env::var("TOUCHHLE_LATENCY_DEBUG").is_ok() {
+            log!("LAT key {:?} pressed={} t={}", key, pressed, debug_ms());
+        }
+        if pressed {
+            if !self.keys_down.insert(key) {
+                return None;
+            }
+        } else if !self.keys_down.remove(&key) {
+            return None;
+        }
+        match action {
+            KeyAction::Touch(i, x, y) => {
+                let coords = transform_input_coords_mapped(self, (x, y), true);
+                let map = HashMap::from([(FingerId::KeyToTouch(i), coords)]);
+                Some(if pressed {
+                    Event::TouchesDown(map)
+                } else {
+                    Event::TouchesUp(map)
+                })
+            }
+            dir => {
+                let (x, y, w, h) = options.dpad_to_touch?;
+                match dir {
+                    KeyAction::DpadUp => self.dpad_state.up = pressed,
+                    KeyAction::DpadDown => self.dpad_state.down = pressed,
+                    KeyAction::DpadLeft => self.dpad_state.left = pressed,
+                    KeyAction::DpadRight => self.dpad_state.right = pressed,
+                    KeyAction::Touch(..) => unreachable!(),
+                }
+                let (cx, cy) = (x + w * 0.5, y + h * 0.5);
+                let mut dx = 0.0;
+                let mut dy = 0.0;
+                if self.dpad_state.left {
+                    dx -= 0.5 * w;
+                }
+                if self.dpad_state.right {
+                    dx += 0.5 * w;
+                }
+                if self.dpad_state.up {
+                    dy -= 0.5 * h;
+                }
+                if self.dpad_state.down {
+                    dy += 0.5 * h;
+                }
+                let coords = transform_input_coords_mapped(self, (cx + dx, cy + dy), true);
+                let any_held = self.dpad_state.left
+                    || self.dpad_state.right
+                    || self.dpad_state.up
+                    || self.dpad_state.down;
+                let map = HashMap::from([(FingerId::DpadToTouch, coords)]);
+                if !self.dpad_state.active && any_held {
+                    self.dpad_state.active = true;
+                    Some(Event::TouchesDown(map))
+                } else if self.dpad_state.active && any_held {
+                    Some(Event::TouchesMove(map))
+                } else if self.dpad_state.active {
+                    self.dpad_state.active = false;
+                    Some(Event::TouchesUp(map))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn controller_added(&mut self, joystick_idx: u32) {
+        if let Some(wanted) = self.controller_choice {
+            if joystick_idx + 1 != wanted {
+                log!(
+                    "Ignoring controller #{} (this window uses controller #{}).",
+                    joystick_idx + 1,
+                    wanted
+                );
+                return;
+            }
+        }
+        let Ok(controller) = self.controller_ctx.open(joystick_idx) else {
+            log!("Warning: A new controller was connected, but it couldn't be accessed!");
+            return;
+        };
+
+        let controller_name = controller.name();
+        if env::consts::OS == "android" && controller_name.starts_with("uinput-") {
+            log!("ignoring fingerprint device: {}", controller_name);
+            return;
+        }
+        log!(
+            "New controller connected: {}. Left stick = device tilt. Right stick = touch input (press the stick or shoulder button to tap/hold).",
+            controller_name
+        );
+        self.controllers.push(controller);
+    }
+    fn controller_removed(&mut self, instance_id: u32) {
+        let Some(idx) = self
+            .controllers
+            .iter()
+            .position(|controller| controller.instance_id() == instance_id)
+        else {
+            return;
+        };
+        let controller = self.controllers.remove(idx);
+        log!("Warning: Controller disconnected: {}", controller.name());
+    }
+    pub fn print_accelerometer_notice(&self, options: &Options) {
+        log!("This app uses the accelerometer.");
+
+        if !self.controllers.is_empty() && options.analog_stick_tilt_controls {
+            log!("Your connected controller's left analog stick will be used for accelerometer simulation.");
+            if self.accelerometer.is_some() {
+                log!("Disconnect the controller if you want to use your device's accelerometer.");
+            }
+        } else if self.accelerometer.is_some() {
+            log!("Your device's accelerometer will be used for accelerometer simulation.");
+            if options.analog_stick_tilt_controls {
+                log!("Connect a controller if you would prefer to use an analog stick.");
+            }
+        } else if self.controllers.is_empty() && options.analog_stick_tilt_controls {
+            log!("Connect a controller to get accelerometer simulation.");
+        }
+
+        if self.accelerometer.is_none() {
+            log!(
+                "You can {}hold right click and move the cursor to simulate the accelerometer.",
+                if options.analog_stick_tilt_controls {
+                    "also "
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
+    /// Get the real or simulated accelerometer output.
+    /// See also [crate::frameworks::uikit::ui_accelerometer].
+    pub fn get_acceleration(&self, options: &Options) -> (f32, f32, f32) {
+        if self.controllers.is_empty() || !options.analog_stick_tilt_controls {
+            if let Some(ref accelerometer) = self.accelerometer {
+                let data = accelerometer.get_data().unwrap();
+                let sdl2::sensor::SensorData::Accel(data) = data else {
+                    panic!();
+                };
+                let [x, y, z] = data;
+                // UIAcceleration reports acceleration towards gravity, but SDL2
+                // reports acceleration away from gravity.
+                let (x, y, z) = (-x, -y, -z);
+                // UIAcceleration reports acceleration in units of g-force, but
+                // SDL2 reports acceleration in units of m/s^2.
+                let gravity: f32 = 9.80665; // SDL_STANDARD_GRAVITY
+                let (x, y, z) = (x / gravity, y / gravity, z / gravity);
+                return (x, y, z);
+            }
+        }
+
+        let (x, y) = if self
+            .virtual_accelerometer_last
+            .is_some_and(|(_x, _y, right_click_hold)| right_click_hold)
+        {
+            self.virtual_accelerometer_last
+                .map(|(x, y, _right_click_hold)| (x, y))
+                .unwrap()
+        } else {
+            // Get left analog stick input. The range is [-1, 1] on each axis.
+            let (x, y, _) = self.get_controller_stick(options, true);
+            (x, y)
+        };
+
+        // Correct for window rotation
+        let [x, y] = self.rotation_matrix().inverse().unwrap().transform([x, y]);
+        let (x, y) = (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0)); // just in case
+
+        // Let's simulate tilting the device based on the analog stick inputs.
+        //
+        // If an iPhone is lying flat on its back, level with the ground, and it
+        // is on Earth, the accelerometer will report approximately (0, 0, -1).
+        // The acceleration x and y axes are aligned with the screen's x and y
+        // axes. +x points to the right of the screen, +y points to the top of
+        // the screen, and +z points away from the screen. In the example
+        // scenario, the z axis is parallel to gravity.
+
+        let gravity: [f32; 3] = [0.0, 0.0, -1.0];
+
+        let neutral_x = options.x_tilt_offset.to_radians();
+        let neutral_y = options.y_tilt_offset.to_radians();
+        let x_rotation_range = options.x_tilt_range.to_radians() / 2.0;
+        let y_rotation_range = options.y_tilt_range.to_radians() / 2.0;
+        // (x, y) are swapped because the controller Y axis usually corresponds
+        // to forward/backward movement, but rotating about the Y axis means
+        // tilting the device left/right.
+        let x_rotation = neutral_x - x_rotation_range * y;
+        let y_rotation = neutral_y - y_rotation_range * x;
+        let matrix =
+            Matrix::<3>::y_rotation(y_rotation).multiply(&Matrix::<3>::x_rotation(x_rotation));
+        let [x, y, z] = matrix.transform(gravity);
+
+        (x, y, z)
+    }
+
+    /// For use when redrawing the screen: Get the cached on-screen position and
+    /// press state of the analog stick-controlled virtual cursor, if it is
+    /// visible.
+    pub fn virtual_cursor_visible_at(&self) -> Option<(f32, f32, bool)> {
+        let real = self.virtual_cursor_last.filter(|c| c.3);
+        // Local: outline the button under the menu pointer, if known.
+        let (gw, gh) = size_for_orientation(
+            self.device_family,
+            self.device_orientation,
+            NonZeroU32::new(1).unwrap(),
+        );
+        let (vx, vy, vw, vh) = self.viewport();
+        let to_win = |x: f32, y: f32| -> (f32, f32) {
+            (
+                vx as f32 + x / gw as f32 * vw as f32,
+                vy as f32 + y / gh as f32 * vh as f32,
+            )
+        };
+        let list_rect = self.list_state.and_then(|(_, sel, scroll, _)| {
+            let lm = self.list_menu.as_ref()?;
+            let cy = list_row_y(lm, sel, scroll);
+            let (x0, y0) = to_win(lm.x - lm.w / 2.0, cy - lm.h / 2.0);
+            let (x1, y1) = to_win(lm.x + lm.w / 2.0, cy + lm.h / 2.0);
+            Some([x0, y0, x1 - x0, y1 - y0])
+        });
+        let rect = list_rect.or_else(|| self.menu_pointer.and_then(|(px, py)| {
+            self.plates
+                .iter()
+                .filter(|p| (p.cx - px).abs() <= p.w / 2.0 + 1.0 && (p.cy - py).abs() <= p.h / 2.0 + 1.0)
+                .min_by(|a, b| (a.w * a.h).total_cmp(&(b.w * b.h)))
+                .map(|p| {
+                    let (x0, y0) = to_win(p.cx - p.w / 2.0, p.cy - p.h / 2.0);
+                    let (x1, y1) = to_win(p.cx + p.w / 2.0, p.cy + p.h / 2.0);
+                    [x0, y0, x1 - x0, y1 - y0]
+                })
+        }));
+        *MENU_HIGHLIGHT.lock().unwrap() = rect;
+        if real.is_none() && rect.is_some() {
+            return None;
+        }
+        if real.is_none() {
+            if let Some((gx, gy)) = self.menu_pointer {
+                // Local: show the screen-menu pointer (game coords -> window).
+                let (w, h) = size_for_orientation(
+                    self.device_family,
+                    self.device_orientation,
+                    NonZeroU32::new(1).unwrap(),
+                );
+                let (vx, vy, vw, vh) = self.viewport();
+                return Some((
+                    vx as f32 + gx / w as f32 * vw as f32,
+                    vy as f32 + gy / h as f32 * vh as f32,
+                    true,
+                ));
+            }
+        }
+        let (x, y, pressed, visible) = self.virtual_cursor_last?;
+        if visible {
+            // When stickyness is in use, the visual cursor movement appears
+            // uncomfortably choppy. Showing the un-sticky position is a bit
+            // misleading but it *feels* better, and it is documented.
+            if let Some((x_unsticky, y_unsticky, _time)) = self.virtual_cursor_last_unsticky {
+                Some((x_unsticky, y_unsticky, pressed))
+            } else {
+                Some((x, y, pressed))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Update the virtual cursor's position, click state and visibility, then
+    /// return the new position, pressed state, whether the press state changed
+    /// and whether the cursor moved.
+    fn update_virtual_cursor(&mut self, options: &Options) -> (f32, f32, bool, bool, bool) {
+        // Get right analog stick input. The range is [-1, 1] on each axis.
+        let (x, y, pressed) = self.get_controller_stick(options, false);
+
+        // Local: only let the tap button (RB / right-stick click) tap when the
+        // pointer is actually being used: the stick is tilted now or was in the
+        // last 2 seconds, or a tap is already in progress. Otherwise pressing
+        // RB would tap the middle of the screen.
+        let aiming = x != 0.0 || y != 0.0;
+        if aiming {
+            self.cursor_last_aim = Some(Instant::now());
+        }
+        let recently_aimed = self
+            .cursor_last_aim
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
+        let already_pressed = self.virtual_cursor_last.is_some_and(|c| c.2);
+        let pressed = pressed && (aiming || recently_aimed || already_pressed);
+
+        // The cursor is intended to only show up once you move the analog stick
+        // out of its deadzone, or while the button is held.
+        let visible = pressed || x != 0.0 || y != 0.0;
+
+        // Though the analog stick output fits within a square, its actual range
+        // is usually a circle enclosed by the square. So we need to cut out the
+        // rectangular shape of the screen from that circle within the square.
+        let (vx, vy, vw, vh) = self.viewport();
+        let (vx, vy, vw, vh) = (vx as f32, vy as f32, vw as f32, vh as f32);
+
+        let (x, y) = {
+            // Use Pythagoras's theorem to find the largest size the rectangle
+            // can have within the circle.
+            let ratio = vw / vh;
+            let rect_height = (ratio * ratio + 1.0).powf(-0.5);
+            let rect_width = ratio * rect_height;
+
+            let x_abs = x.abs().min(rect_width) / rect_width;
+            let y_abs = y.abs().min(rect_height) / rect_height;
+            (x_abs.copysign(x), y_abs.copysign(y))
+        };
+
+        // Convert to on-screen window co-ordinates
+        let x = (x / 2.0 + 0.5) * vw + vx;
+        let y = (y / 2.0 + 0.5) * vh + vy;
+
+        let (old_x, old_y, old_pressed, _old_visible) =
+            self.virtual_cursor_last.unwrap_or_default();
+
+        let (x, y) = if let Some((smoothing_strength, sticky_radius)) =
+            options.stabilize_virtual_cursor
+        {
+            let new_time = Instant::now();
+
+            let (old_x_unsticky, old_y_unsticky, old_time) = self
+                .virtual_cursor_last_unsticky
+                .unwrap_or((0.0, 0.0, new_time));
+
+            let delta_t = new_time.saturating_duration_since(old_time).as_secs_f32();
+
+            // Apply a feedback-based smoothing with exponential decay, to try
+            // to dampen shakiness in the stick movement.
+
+            let smooth = |old: f32, new: f32| -> f32 {
+                if smoothing_strength != 0.0 {
+                    let lerp_factor = 1.0 - (0.5_f32).powf(delta_t * (1.0 / smoothing_strength));
+                    old + (new - old) * lerp_factor
+                } else {
+                    new
+                }
+            };
+
+            let new_x_unsticky = smooth(old_x_unsticky, x);
+            let new_y_unsticky = smooth(old_y_unsticky, y);
+
+            self.virtual_cursor_last_unsticky = Some((new_x_unsticky, new_y_unsticky, new_time));
+
+            // Make the reported position "sticky" within a certain radius, i.e.
+            // if the new position's distance from the old one is within the
+            // radius, report no change in position.
+
+            if (new_x_unsticky - old_x).hypot(new_y_unsticky - old_y) < sticky_radius {
+                (old_x, old_y)
+            } else {
+                (new_x_unsticky, new_y_unsticky)
+            }
+        } else {
+            (x, y)
+        };
+
+        self.virtual_cursor_last = Some((x, y, pressed, visible));
+
+        (
+            x,
+            y,
+            pressed,
+            pressed != old_pressed,
+            x != old_x || y != old_y,
+        )
+    }
+
+    /// Get the summed X and Y positions and button state of the left or right
+    /// analog stick of the game controllers. Each axis value is in the range
+    /// [-1, 1].
+    fn get_controller_stick(&self, options: &Options, left: bool) -> (f32, f32, bool) {
+        fn convert_axis(axis: i16, deadzone: f32) -> f32 {
+            assert!(deadzone >= 0.0);
+            let axis = ((axis as f32) / (i16::MAX as f32)).clamp(-1.0, 1.0);
+            let abs_axis = (axis.abs().max(deadzone) - deadzone) / (1.0 - deadzone);
+            abs_axis.copysign(axis)
+        }
+
+        let (mut x, mut y) = (0.0, 0.0);
+        let mut pressed = false;
+        for controller in &self.controllers {
+            use sdl2::controller::{Axis, Button};
+            let (x_axis, y_axis, button1, button2) = if left {
+                (
+                    Axis::LeftX,
+                    Axis::LeftY,
+                    Button::LeftStick,
+                    Button::LeftShoulder,
+                )
+            } else {
+                (
+                    Axis::RightX,
+                    Axis::RightY,
+                    Button::RightStick,
+                    Button::RightShoulder,
+                )
+            };
+            x += convert_axis(controller.axis(x_axis), options.deadzone);
+            y += convert_axis(controller.axis(y_axis), options.deadzone);
+            // Local: don't let buttons mapped with --button-to-touch also
+            // act as the virtual cursor's tap button.
+            let mapped = |b: Button| {
+                let name = match b {
+                    Button::LeftStick => Some(crate::options::Button::LeftStick),
+                    Button::RightStick => Some(crate::options::Button::RightStick),
+                    Button::LeftShoulder => Some(crate::options::Button::LeftShoulder),
+                    Button::RightShoulder => Some(crate::options::Button::RightShoulder),
+                    _ => None,
+                };
+                name.is_some_and(|n| options.button_to_touch.contains_key(&n))
+            };
+            pressed |= controller.button(button1) && !mapped(button1);
+            pressed |= controller.button(button2) && !mapped(button2);
+        }
+        let (x, y) = (x.clamp(-1.0, 1.0), y.clamp(-1.0, 1.0));
+
+        (x, y, pressed)
+    }
+
+    pub fn create_gl_context(&self, version: GLVersion) -> Result<GLContext, String> {
+        let attr = self.video_ctx.gl_attr();
+        match version {
+            GLVersion::GLES11 => {
+                attr.set_context_version(1, 1);
+                attr.set_context_profile(sdl2::video::GLProfile::GLES);
+            }
+            GLVersion::GL21Compat => {
+                attr.set_context_version(2, 1);
+                attr.set_context_profile(sdl2::video::GLProfile::Compatibility);
+            }
+        }
+
+        let gl_ctx = self.window.gl_create_context()?;
+
+        Ok(GLContext(gl_ctx))
+    }
+
+    pub fn gl_get_proc_address(&self, procname: &str) -> *const std::ffi::c_void {
+        // For some reason, rust-sdl2 uses *const (), but () is not meant to be
+        // used for void pointees (just void results), so let's fix that.
+        self.video_ctx.gl_get_proc_address(procname) as *const _
+    }
+
+    pub fn set_share_with_current_context(&self, value: bool) {
+        self.video_ctx
+            .gl_attr()
+            .set_share_with_current_context(value)
+    }
+
+    pub unsafe fn make_gl_context_current(&self, gl_ctx: &GLContext) {
+        self.window.gl_make_current(&gl_ctx.0).unwrap();
+    }
+
+    /// Make the internal OpenGL ES context (for splash screen and UI rendering)
+    /// current.
+    #[must_use]
+    pub fn make_internal_gl_ctx_current<'win>(&'win mut self) -> Box<dyn GLES + 'win> {
+        // The invariant is held up here - since the instance we return is
+        // bound to the lifetime of window, it can't outlive the internal GL
+        // context and can't outlive the window.
+        let gl_ins = unsafe {
+            self.internal_gl_ins
+                .as_mut()
+                .unwrap()
+                .make_current_unchecked_for_window(
+                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
+                )
+        };
+        gl_ins
+    }
+
+    fn display_splash(&mut self) {
+        assert!(self.splash_image.is_some());
+
+        // OpenGL ES expects bottom-to-top row order for image data, but our
+        // image data will be top-to-bottom. A reflection transform compensates.
+        let matrix = self.rotation_matrix().multiply(&Matrix::y_flip());
+        let (vx, vy, vw, vh) = self.viewport();
+        let viewport = (vx, vy + self.viewport_y_offset(), vw, vh);
+
+        let image = self.splash_image.as_ref().unwrap();
+
+        unsafe {
+            let mut gl_ctx = self
+                .internal_gl_ins
+                .as_mut()
+                .unwrap()
+                .make_current_unchecked_for_window(
+                    &mut |gl_ctx| self.window.gl_make_current(&gl_ctx.0).unwrap(),
+                    &mut |s| self.video_ctx.gl_get_proc_address(s) as *const _,
+                );
+
+            use crate::gles::gles11_raw as gles11; // constants only
+
+            let mut texture = 0;
+            gl_ctx.GenTextures(1, &mut texture);
+            gl_ctx.BindTexture(gles11::TEXTURE_2D, texture);
+            let (width, height) = image.dimensions();
+            gl_ctx.TexImage2D(
+                gles11::TEXTURE_2D,
+                0,
+                gles11::RGBA as _,
+                width as _,
+                height as _,
+                0,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                image.pixels().as_ptr() as *const _,
+            );
+            gl_ctx.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MIN_FILTER,
+                gles11::LINEAR as _,
+            );
+            gl_ctx.TexParameteri(
+                gles11::TEXTURE_2D,
+                gles11::TEXTURE_MAG_FILTER,
+                gles11::LINEAR as _,
+            );
+
+            present_frame(
+                gl_ctx.as_mut(),
+                viewport,
+                matrix,
+                /* virtual_cursor_visible_at: */ None,
+            );
+
+            gl_ctx.DeleteTextures(1, &texture);
+        };
+
+        self.window.gl_swap_window();
+
+        // hold onto GL context so the image doesn't disappear, and hold
+        // onto image so we can rotate later if necessary
+    }
+
+    /// Swap front-buffer and back-buffer so the result of OpenGL rendering is
+    /// presented.
+    pub fn swap_window(&self) {
+        self.window.gl_swap_window();
+    }
+
+    /// Consider the emulated device to be rotated to a particular orientation.
+    ///
+    /// On a PC or laptop, this will make the window be rotated so the app
+    /// content appears upright. On a mobile device, this might do something
+    /// else, because the user can physically rotate the screen.
+    pub fn rotate_device(&mut self, new_orientation: DeviceOrientation) {
+        assert!(self.on_main_stack);
+        if new_orientation == self.device_orientation {
+            return;
+        }
+
+        if !self.fullscreen && !Self::rotatable_fullscreen() {
+            let (width, height) = if Self::rotatable_fullscreen() {
+                set_sdl2_orientation(new_orientation);
+                rotate_fullscreen_size(new_orientation, self.window.size())
+            } else {
+                let (w, h) =
+                    size_for_orientation(self.device_family, new_orientation, self.scale_hack);
+                // Local: keep the user's window scale when rotating.
+                let (cur_w, cur_h) = self.window.size();
+                let (old_w, old_h) =
+                    size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
+                let scale = (cur_w as f32 / old_w as f32).max(cur_h as f32 / old_h as f32).max(0.5);
+                ((w as f32 * scale).round() as u32, (h as f32 * scale).round() as u32)
+            };
+
+            // macOS quirk: when resizing the window, the new framebuffer's size
+            // is apparently max(new_size, old_size) in each dimension, but the
+            // viewport is positioned wrong on the y axis for some reason, so we
+            // need to apply an offset.
+            // Recreating the OpenGL context was an alternative workaround, but
+            // that apparently stops other OpenGL contexts drawing to the
+            // framebuffer!
+            #[cfg(target_os = "macos")]
+            {
+                let (_old_width, old_height) = self.window.size();
+                self.max_height = self.max_height.max(old_height).max(height);
+                self.viewport_y_offset = self.max_height - height;
+            }
+
+            self.window.set_size(width, height).unwrap();
+        }
+
+        if Self::rotatable_fullscreen() {
+            set_sdl2_orientation(new_orientation);
+            // Hack: from reading SDL2's source code, it seems that SDL2 will
+            // only re-do the orientation when changing whether a window is
+            // "resizeable" (can be rotated). You can't set the resizeable state
+            // on a fullscreen window, so it must be temporarily stop being
+            // fulscreen.
+            // Apparently, doing this does result in resizing the window.
+            self.window
+                .set_fullscreen(sdl2::video::FullscreenType::Off)
+                .unwrap();
+            unsafe {
+                let window_raw = self.window.raw();
+                sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_FALSE);
+                sdl2_sys::SDL_SetWindowResizable(window_raw, sdl2_sys::SDL_bool::SDL_TRUE);
+            }
+            self.window
+                .set_fullscreen(sdl2::video::FullscreenType::True)
+                .unwrap();
+        }
+
+        self.device_orientation = new_orientation;
+
+        if self.splash_image.is_some() {
+            self.display_splash();
+        }
+    }
+
+    pub fn device_family(&self) -> DeviceFamily {
+        self.device_family
+    }
+
+    /// Returns the current device orientation
+    pub fn current_rotation(&self) -> DeviceOrientation {
+        self.device_orientation
+    }
+
+    /// Get the size in pixels of the window without rotation or scaling.
+    ///
+    /// The aspect ratio, scale and orientation reflect the guest app's view of
+    /// the world.
+    pub fn size_unrotated_unscaled(&self) -> (u32, u32) {
+        size_for_orientation(
+            self.device_family,
+            DeviceOrientation::Portrait,
+            NonZeroU32::new(1).unwrap(),
+        )
+    }
+
+    /// Get the region of the on-screen window (x, y, width, height) used to
+    /// display the app content.
+    ///
+    /// The aspect ratio of this region always reflects the guest app's view of
+    /// the world, but the scale and orientation might not.
+    pub fn viewport(&self) -> (u32, u32, u32, u32) {
+        let (app_width, app_height) =
+            size_for_orientation(self.device_family, self.device_orientation, self.scale_hack);
+        // Local: windows can be scaled/resized, so always fit the picture to
+        // the window, letterboxed.
+
+        let (screen_width, screen_height) = self.window.drawable_size();
+
+        let app_aspect = app_width as f32 / app_height as f32;
+        let screen_aspect = screen_width as f32 / screen_height as f32;
+        let (scaled_width, scaled_height) = if app_aspect < screen_aspect {
+            (
+                (screen_height as f32 * app_aspect).round() as u32,
+                screen_height,
+            )
+        } else {
+            (
+                screen_width,
+                (screen_width as f32 / app_aspect).round() as u32,
+            )
+        };
+        let x = (screen_width - scaled_width) / 2;
+        let y = (screen_height - scaled_height) / 2;
+        (x, y, scaled_width, scaled_height)
+    }
+
+    /// Special offset to add to y co-ordinates, only when drawing to screen.
+    pub fn viewport_y_offset(&self) -> u32 {
+        #[cfg(target_os = "macos")]
+        return self.viewport_y_offset;
+        #[cfg(not(target_os = "macos"))]
+        return 0;
+    }
+
+    /// Transformation matrix for transforming between the window's co-ordinate
+    /// space and the app's original co-ordinate space when rotation is in use
+    /// (see [Self::rotate_device]). This returns a matrix appropriate for
+    /// rotating texture co-ordinates to display the image in the window; when
+    /// rotating input co-ordinates, invert the matrix.
+    pub fn rotation_matrix(&self) -> Matrix<2> {
+        match self.device_orientation {
+            DeviceOrientation::Portrait => Matrix::identity(),
+            DeviceOrientation::PortraitUpsideDown => Matrix::z_rotation(PI),
+            DeviceOrientation::LandscapeLeft => Matrix::z_rotation(-FRAC_PI_2),
+            DeviceOrientation::LandscapeRight => Matrix::z_rotation(FRAC_PI_2),
+        }
+    }
+
+    pub fn is_screen_saver_enabled(&self) -> bool {
+        self.video_ctx.is_screen_saver_enabled()
+    }
+    pub fn set_screen_saver_enabled(&mut self, enabled: bool) {
+        assert!(self.on_main_stack);
+        match enabled {
+            true => self.video_ctx.enable_screen_saver(),
+            false => self.video_ctx.disable_screen_saver(),
+        }
+    }
+
+    pub fn start_text_input(&self) {
+        assert!(self.on_main_stack);
+        unsafe {
+            sdl2_sys::SDL_StartTextInput();
+        }
+    }
+    pub fn stop_text_input(&self) {
+        assert!(self.on_main_stack);
+        unsafe {
+            sdl2_sys::SDL_StopTextInput();
+        }
+    }
+
+    pub fn on_main_stack(&self) -> bool {
+        self.on_main_stack
+    }
+}
+
+pub fn open_url(env: &mut Environment, url: &str) -> Result<(), String> {
+    env.on_parent_stack_in_coroutine(|_, _| sdl2::url::open_url(url).map_err(|e| e.to_string()))
+}
+
+/// Show an SDL messagebox for an error (typically after a panic).
+///
+/// The window argument allows for passing in the parent window for the
+/// messagebox, which is not required but should be done if possible.
+pub fn show_error_messagebox(window: Option<&Window>, error_message: &str) {
+    assert!(window.is_none_or(|win| win.on_main_stack));
+    use sdl2::messagebox;
+    let mbox = [
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 0,
+            text: "Open touchHLE directory",
+        },
+        messagebox::ButtonData {
+            flags: messagebox::MessageBoxButtonFlag::NOTHING,
+            button_id: 1,
+            text: "Close",
+        },
+    ];
+
+    let Ok(clicked_button) = messagebox::show_message_box(
+        messagebox::MessageBoxFlag::ERROR,
+        &mbox,
+        "touchHLE crashed!",
+        &format!("touchHLE crashed with the following error: {error_message}"),
+        window.map(|win| &win.window),
+        None,
+    ) else {
+        panic!("Failed to show message box!");
+    };
+
+    match clicked_button {
+        messagebox::ClickedButton::CloseButton => {}
+        messagebox::ClickedButton::CustomButton(button) => {
+            match button.button_id {
+                // Open data directory (contains log file on android)
+                0 => match crate::paths::url_for_opening_user_data_dir() {
+                    Ok(url) => {
+                        if let Err(e) = sdl2::url::open_url(&url).map_err(|e| e.to_string()) {
+                            echo!("Couldn't open file manager at {:?}: {}", url, e);
+                        } else {
+                            echo!("Opened file manager at {:?}, exiting.", url);
+                        }
+                    }
+                    Err(e) => echo!("Couldn't open file manager: {}", e),
+                },
+                // Close
+                1 => {}
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+/// Get current battery state from SDL2.
+///
+/// Returns:
+/// - pct: i32 - percentage of battery remaining.
+/// - status: [BatteryState] - the current status of the battery
+///   (unplugged, charging, full, etc.)
+pub fn get_battery_status() -> (i32, BatteryState) {
+    if env::consts::OS == "android" {
+        log_once!(
+            "Warning: get_battery_status on Android, returning fully charged to avoid SDL crash"
+        );
+        // Android_JNI_GetPowerInfo is crashing with `JNI DETECTED ERROR IN
+        // APPLICATION: JNI ERROR (app bug): jobject is an invalid JNI
+        // transition frame reference: 0x7b1bc0c7a0 (use of invalid jobject)`
+        // TODO: See if updating SDL fixes that
+        return (100, BatteryState::Full);
+    }
+    let mut pct = 0;
+    // Unfortunately, Rust-SDL2 does not expose this function yet.
+    // iPhoneOS does not measure the battery in seconds remaining,
+    // so we discard this argument.
+    let status = unsafe { sdl2_sys::SDL_GetPowerInfo(null_mut(), &mut pct) };
+    (
+        pct,
+        match status {
+            SDL_PowerState::SDL_POWERSTATE_UNKNOWN => BatteryState::Unknown,
+            SDL_PowerState::SDL_POWERSTATE_ON_BATTERY => BatteryState::OnBattery,
+            SDL_PowerState::SDL_POWERSTATE_NO_BATTERY => BatteryState::NoBattery,
+            SDL_PowerState::SDL_POWERSTATE_CHARGING => BatteryState::Charging,
+            SDL_PowerState::SDL_POWERSTATE_CHARGED => BatteryState::Full,
+        },
+    )
+}
+
+pub fn get_preferred_language_codes(env: &mut Environment) -> Vec<String> {
+    env.on_parent_stack_in_coroutine(|_, _| {
+        sdl2::locale::get_preferred_locales()
+            .map(|loc| loc.lang)
+            .collect()
+    })
+}
+
+pub fn get_preferred_country_codes(env: &mut Environment) -> Vec<String> {
+    env.on_parent_stack_in_coroutine(|_, _| {
+        sdl2::locale::get_preferred_locales()
+            .filter_map(|loc| loc.country)
+            .collect()
+    })
+}
+
+// Local: module-level copy of the coordinate transform used by poll_for_events.
+fn transform_input_coords_mapped(
+    window: &Window,
+    (in_x, in_y): (f32, f32),
+    independent_of_viewport: bool,
+) -> (f32, f32) {
+    let (vx, vy, vw, vh) = if independent_of_viewport {
+        let (width, height) = size_for_orientation(
+            window.device_family,
+            window.device_orientation,
+            NonZeroU32::new(1).unwrap(),
+        );
+        (0, 0, width, height)
+    } else {
+        window.viewport()
+    };
+    // normalize to unit square centred on origin
+    let x = (in_x - vx as f32) / vw as f32 - 0.5;
+    let y = (in_y - vy as f32) / vh as f32 - 0.5;
+    // rotate
+    let matrix = window.rotation_matrix().inverse().unwrap();
+    let [x, y] = matrix.transform([x, y]);
+    // back to pixels
+    let (out_w, out_h) = window.size_unrotated_unscaled();
+    let out_x = (x + 0.5) * out_w as f32;
+    let out_y = (y + 0.5) * out_h as f32;
+    // Round to match touch precision of official devices.
+    (out_x.round(), out_y.round())
+}
