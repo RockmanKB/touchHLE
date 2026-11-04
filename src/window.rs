@@ -304,6 +304,9 @@ pub struct Window {
     window: sdl2::video::Window,
     /// Local: is the window border hidden?
     borderless: bool,
+    /// Local: how much the window grew when its border was hidden
+    /// (x, y, width, height), to undo when the border comes back.
+    border_grow: Option<(i32, i32, i32, i32)>,
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
@@ -340,6 +343,10 @@ pub struct Window {
     list_state: Option<(u32, usize, usize, bool)>,
     list_menu: Option<crate::options::ListMenu>,
     list_busy_until: Option<Instant>,
+    /// Local: the app's list state (scroll px, max scroll, selected row), if known.
+    list_game: Option<(i32, i32, i32)>,
+    /// Local: scroll value to write into the app.
+    list_scroll_write: Option<i32>,
     combo: ComboState,
     /// Local: analog triggers currently counted as pressed (left, right).
     triggers_down: [bool; 2],
@@ -575,6 +582,7 @@ impl Window {
             video_ctx,
             window,
             borderless: options.borderless,
+            border_grow: None,
             event_pump,
             event_queue: VecDeque::new(),
             last_polled: Instant::now() - Duration::from_secs(1),
@@ -613,6 +621,8 @@ impl Window {
             list_state: None,
             list_menu: None,
             list_busy_until: None,
+            list_game: None,
+            list_scroll_write: None,
             combo: ComboState::default(),
             triggers_down: [false; 2],
             plates: Vec::new(),
@@ -860,8 +870,7 @@ impl Window {
                     // Local: border toggle key (this window only).
                     if options.border_toggle_key.as_deref() == Some(k.name().as_str()) {
                         if pressed {
-                            self.borderless = !self.borderless;
-                            self.window.set_bordered(!self.borderless);
+                            self.toggle_border();
                         }
                         continue;
                     }
@@ -1909,6 +1918,112 @@ impl Window {
         Some(self.tap_events(cur))
     }
 
+    /// Local: show or hide the window border. The picture grows into the
+    /// space the title bar used (keeping its shape), and shrinks back after.
+    fn toggle_border(&mut self) {
+        use sdl2::video::WindowPos::Positioned;
+        let (x, y) = self.window.position();
+        let (w, h) = self.window.size();
+        if !self.borderless {
+            // Title bar height; fall back to a typical Windows value.
+            let top = self
+                .window
+                .border_size()
+                .ok()
+                .map(|(t, _, _, _)| t as i32)
+                .filter(|&t| t > 0 && t < 100)
+                .unwrap_or(31);
+            self.window.set_bordered(false);
+            self.borderless = true;
+            let new_h = h as i32 + top;
+            let new_w = (w as f32 * new_h as f32 / h.max(1) as f32).round() as i32;
+            let dx = (new_w - w as i32) / 2;
+            let grow = (dx, top, new_w - w as i32, top);
+            let _ = self.window.set_size(new_w as u32, new_h as u32);
+            self.window.set_position(Positioned(x - grow.0), Positioned(y - grow.1));
+            self.border_grow = Some(grow);
+        } else {
+            self.window.set_bordered(true);
+            self.borderless = false;
+            if let Some((gx, gy, gw, gh)) = self.border_grow.take() {
+                let nw = (w as i32 - gw).max(160) as u32;
+                let nh = (h as i32 - gh).max(120) as u32;
+                let _ = self.window.set_size(nw, nh);
+                self.window.set_position(Positioned(x + gx), Positioned(y + gy));
+            }
+        }
+    }
+
+    /// Local: the app's live list state (see `--context-list-state=`).
+    pub fn set_list_game_state(&mut self, v: Option<(i32, i32, i32)>) {
+        self.list_game = v;
+    }
+
+    /// Local: a scroll position to write into the app, if one is pending.
+    pub fn take_list_scroll_write(&mut self) -> Option<i32> {
+        self.list_scroll_write.take()
+    }
+
+    /// Local: list menu input when the app's list state can be read: the
+    /// list is scrolled by setting its scroll position, then the row is tapped.
+    fn list_menu_input_live(
+        &mut self,
+        lm: &crate::options::ListMenu,
+        (scroll, max, sel): (i32, i32, i32),
+        dir: i32,
+        change: bool,
+    ) -> Vec<Event> {
+        if std::env::var("TOUCHHLE_LIST_DEBUG").is_ok() {
+            log!("List: scroll={} max={} sel={} dir={} change={}", scroll, max, sel, dir, change);
+        }
+        let total = lm.total as i32;
+        // Hidden rows (unlockable extras) leave gaps in the app's numbering,
+        // so the last row can have a higher number than its position.
+        let sel = if sel >= 0 { sel.min(total - 1) } else { sel };
+        let step = lm.step as i32;
+        let visible = lm.visible as i32;
+        let target = if dir != 0 {
+            if sel < 0 {
+                0
+            } else {
+                (sel + dir).clamp(0, total - 1)
+            }
+        } else {
+            sel.max(0)
+        };
+        if dir != 0 && target == sel {
+            return Vec::new();
+        }
+        // Scroll so the row is fully on screen.
+        let top = -scroll / step.max(1);
+        let mut new_scroll = scroll;
+        if target < top || scroll % step != 0 && target == top {
+            new_scroll = -(target * step);
+        } else if target >= top + visible {
+            new_scroll = -((target - visible + 1) * step);
+        }
+        let new_scroll = new_scroll.clamp(-max.max(0), 0);
+        let mut evs = Vec::new();
+        let mut delay = 0;
+        if new_scroll != scroll {
+            self.list_scroll_write = Some(new_scroll);
+            delay = 120;
+        }
+        let y = lm.y0 + new_scroll as f32 + target as f32 * lm.step;
+        let pos = (lm.x, y);
+        // A tap on an unselected row selects it; on the selected row it
+        // changes the value.
+        if dir != 0 || sel != target {
+            self.tap_later(pos, delay, &mut evs);
+            if change {
+                self.tap_later(pos, delay + 250, &mut evs);
+            }
+        } else if change {
+            self.tap_later(pos, delay, &mut evs);
+        }
+        evs
+    }
+
     /// Local: d-pad input on a scrolling list menu.
     fn list_menu_input(
         &mut self,
@@ -1939,6 +2054,16 @@ impl Window {
             CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
             CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
         };
+        if let Some(game) = self.list_game {
+            if back {
+                return self.tap_events(lm.back);
+            }
+            let dir = if up { -1 } else if down { 1 } else { 0 };
+            if dir == 0 && !(side || confirm) {
+                return Vec::new();
+            }
+            return self.list_menu_input_live(lm, game, dir, dir == 0);
+        }
         let (_, mut sel, mut scroll, tapped) = match self.list_state {
             Some(s) if s.0 == ctx => s,
             _ => (ctx, 0, 0, false),

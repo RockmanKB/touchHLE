@@ -1494,8 +1494,19 @@ impl Environment {
                         }
                         STALL.with(|s| s.set((cur, Some(since), reported)));
                     }
+                    // Local: a list menu's live state (scroll, selected row).
+                    let list_state = vals.first().and_then(|ctx| {
+                        self.options.list_states.iter().find(|l| l.0.contains(ctx))
+                    });
+                    let list_vals = list_state.filter(|_| base >= 0x1000).map(|&(_, so, mo, se)| {
+                        (read(so) as i32, read(mo) as i32, read(se) as i32, base + so)
+                    });
                     if let Some(ref mut window) = self.window {
                         window.set_context(vals, &self.options);
+                        window.set_list_game_state(list_vals.map(|v| (v.0, v.1, v.2)));
+                        if let (Some(v), Some(addr)) = (window.take_list_scroll_write(), list_vals.map(|v| v.3)) {
+                            self.mem.write(crate::mem::MutPtr::<i32>::from_bits(addr), v);
+                        }
                     }
                     if base >= 0x1000 && std::env::var("TOUCHHLE_LATENCY_DEBUG").is_ok() {
                         let r32 = |a: u32| -> u32 {

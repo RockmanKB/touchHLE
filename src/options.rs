@@ -156,6 +156,9 @@ pub struct Options {
     pub context_taps: Vec<ContextTap>,
     pub context_menus: Vec<ContextMenu>,
     pub list_menus: Vec<ListMenu>,
+    /// Local: where a list menu's state is in app memory, as offsets from
+    /// the context probe base: (screens, scroll px (<= 0), max scroll, selected row).
+    pub list_states: Vec<(Vec<u32>, u32, u32, u32)>,
     /// Local: classic combos. Left/right + the button at this spot becomes
     /// up + that button.
     pub classic_headbutt: Option<(f32, f32)>,
@@ -218,6 +221,7 @@ impl Default for Options {
             context_taps: Vec::new(),
             context_menus: Vec::new(),
             list_menus: Vec::new(),
+            list_states: Vec::new(),
             classic_headbutt: None,
             classic_elbow: None,
             menu_confirm_buttons: Vec::new(),
@@ -396,6 +400,24 @@ impl Options {
                 return Err("--classic-elbow= requires X1,Y1,X2,Y2,X3,Y3".to_string());
             }
             self.classic_elbow = Some([(n[0], n[1]), (n[2], n[3]), (n[4], n[5])]);
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-list-state=") {
+            // SCREEN,SCROLL_OFFSET,MAX_SCROLL_OFFSET,SELECTED_OFFSET
+            let parts: Vec<&str> = value.split(',').collect();
+            if parts.len() != 4 {
+                return Err("--context-list-state= requires SCREEN,SCROLL,MAX,SELECTED".to_string());
+            }
+            let n = |s: &str| -> Result<u32, String> {
+                let s = s.trim();
+                if let Some(h) = s.strip_prefix("0x") {
+                    u32::from_str_radix(h, 16)
+                } else {
+                    s.parse()
+                }
+                .map_err(|_| "--context-list-state= numbers are invalid".to_string())
+            };
+            self.list_states
+                .push((parse_contexts(parts[0])?, n(parts[1])?, n(parts[2])?, n(parts[3])?));
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--context-list-menu=") {
             // SCREEN,X,Y0,STEP,W,H,VISIBLE,TOTAL,UPX,UPY,DOWNX,DOWNY,BACKX,BACKY

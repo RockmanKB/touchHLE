@@ -532,6 +532,8 @@ code { font-family: var(--font-mono); font-size: .92em; }
 
     // Options screen: a scrolling list. Rows are 50 apart; arrows scroll it.
     a.push(`--context-list-menu=${SCREENS.options},230,53,50,280,44,4,8,375,38,375,240,448,22`);
+    // ...and where the game keeps that list's scroll position, scroll limit and selected row.
+    a.push(`--context-list-state=${SCREENS.options},0x1a04,0x1a08,0x1a00`);
     // Classic combos: small changes to the game's own move code (same for both
     // players, so co-op windows stay in sync). Left/Right + D = headbutt (instead
     // of Up + D); Jump + Punch/Attack within 2 frames = back elbow (instead of
