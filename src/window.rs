@@ -296,6 +296,8 @@ pub struct Window {
     plates_seen: Vec<(Instant, Vec<Plate>)>,
     plate_sel: Option<(f32, f32)>,
     plate_user_moved: bool,
+    plate_nav_was_active: bool,
+    move_touch_last: HashMap<FingerId, Coords>,
     plate_followup: Option<(Instant, (f32, f32), bool)>,
     pending_ups: Vec<(Instant, Event)>,
     ctx_key_taps: Vec<(usize, sdl2::keyboard::Keycode)>,
@@ -556,6 +558,8 @@ impl Window {
             plates_seen: Vec::new(),
             plate_sel: None,
             plate_user_moved: false,
+            plate_nav_was_active: false,
+            move_touch_last: HashMap::new(),
             plate_followup: None,
             pending_ups: Vec::new(),
             ctx_key_taps,
@@ -823,6 +827,7 @@ impl Window {
                     ..
                 } if self.in_menu_context(options) => {
                     controller_updated = true;
+                    self.release_movement_touches();
                     continue;
                 }
                 _ => {}
@@ -1132,6 +1137,25 @@ impl Window {
             })
         }
 
+        // Local: remember where the movement fingers are, for clean releases.
+        for ev in self.event_queue.iter() {
+            match ev {
+                Event::TouchesDown(m) | Event::TouchesMove(m) => {
+                    for (f, c) in m {
+                        if matches!(f, FingerId::DpadToTouch | FingerId::StickToTouch) {
+                            self.move_touch_last.insert(*f, *c);
+                        }
+                    }
+                }
+                Event::TouchesUp(m) => {
+                    for f in m.keys() {
+                        self.move_touch_last.remove(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if controller_updated {
             let (new_x, new_y, pressed, pressed_changed, moved) =
                 self.update_virtual_cursor(options);
@@ -1187,22 +1211,33 @@ impl Window {
             }
             // Release movement touches when entering or leaving a menu screen,
             // so nothing stays held there.
-            if was_menu != self.menu_ctx_active && self.dpad_state.active {
-                self.dpad_state = DpadState {
-                    left: false,
-                    right: false,
-                    up: false,
-                    down: false,
-                    active: false,
-                };
-                self.event_queue
-                    .push_back(Event::TouchesUp(HashMap::from([(FingerId::DpadToTouch, (0.0, 0.0))])));
+            if was_menu != self.menu_ctx_active {
+                self.release_movement_touches();
             }
-            if was_menu != self.menu_ctx_active && self.stick_active {
-                self.stick_active = false;
-                self.event_queue
-                    .push_back(Event::TouchesUp(HashMap::from([(FingerId::StickToTouch, (0.0, 0.0))])));
-            }
+        }
+    }
+
+    /// Local: lift the simulated movement fingers (d-pad and left stick), so
+    /// none stays pressed when a menu screen stops listening to them. A stuck
+    /// finger makes single-touch screens ignore every new tap.
+    fn release_movement_touches(&mut self) {
+        if self.dpad_state.active {
+            self.dpad_state = DpadState {
+                left: false,
+                right: false,
+                up: false,
+                down: false,
+                active: false,
+            };
+            let c = self.move_touch_last.remove(&FingerId::DpadToTouch).unwrap_or((0.0, 0.0));
+            self.event_queue
+                .push_back(Event::TouchesUp(HashMap::from([(FingerId::DpadToTouch, c)])));
+        }
+        if self.stick_active {
+            self.stick_active = false;
+            let c = self.move_touch_last.remove(&FingerId::StickToTouch).unwrap_or((0.0, 0.0));
+            self.event_queue
+                .push_back(Event::TouchesUp(HashMap::from([(FingerId::StickToTouch, c)])));
         }
     }
 
@@ -1252,7 +1287,12 @@ impl Window {
             log!("Plates ({:x?}): {:?}", self.context, best);
         }
         self.plates = best;
-        if self.plate_nav_active(options) {
+        let nav_active = self.plate_nav_active(options);
+        if nav_active && !self.plate_nav_was_active {
+            self.release_movement_touches();
+        }
+        self.plate_nav_was_active = nav_active;
+        if nav_active {
             if self.plate_user_moved
                 && self.plate_sel.and_then(|s| self.nearest_plate(s, 6.0)).is_none()
             {

@@ -137,6 +137,7 @@ pub struct Options {
     pub menu_confirm_keys: Vec<String>,
     pub touch_plates: bool,
     pub window_scale: f32,
+    pub stall_dumps: Vec<(u32, u32, u32, u32)>,
     pub patches_u32: Vec<(u32, u32, u32)>,
     pub extra_plates: Vec<(Vec<u32>, Vec<[f32; 4]>)>,
     pub menu_back_buttons: Vec<Button>,
@@ -187,6 +188,7 @@ impl Default for Options {
             menu_confirm_keys: Vec::new(),
             touch_plates: false,
             window_scale: 1.0,
+            stall_dumps: Vec::new(),
             patches_u32: Vec::new(),
             extra_plates: Vec::new(),
             menu_back_buttons: Vec::new(),
@@ -351,6 +353,23 @@ impl Options {
                 parse_contexts(ctx)?,
                 nums.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect(),
             ));
+            return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--stall-dump=") {
+            // SCREEN,SECONDS,OFFSET,LENGTH: if the app stays on SCREEN for
+            // SECONDS, log LENGTH bytes at probe base + OFFSET (diagnostics).
+            let n = |s: &str| -> Result<u32, String> {
+                let s = s.trim();
+                match s.strip_prefix("0x") {
+                    Some(h) => u32::from_str_radix(h, 16),
+                    None => s.parse(),
+                }
+                .map_err(|_| format!("--stall-dump=: bad number {s:?}"))
+            };
+            let p: Vec<&str> = value.split(',').collect();
+            let [c, t, o, l] = p[..] else {
+                return Err("--stall-dump= requires SCREEN,SECONDS,OFFSET,LENGTH".to_string());
+            };
+            self.stall_dumps.push((n(c)?, n(t)?, n(o)?, n(l)?.min(256)));
             return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--patch-u32=") {
             let n = |s: &str| -> Result<u32, String> {

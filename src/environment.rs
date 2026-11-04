@@ -1463,6 +1463,37 @@ impl Environment {
                     } else {
                         offs.iter().map(|&o| read(o)).collect()
                     };
+                    // Local: diagnostics for screens the app gets stuck on.
+                    if base >= 0x1000 && !self.options.stall_dumps.is_empty() {
+                        thread_local!(static STALL: std::cell::Cell<(u32, Option<std::time::Instant>, u32)> = const { std::cell::Cell::new((0, None, 0)) });
+                        let cur = vals.first().copied().unwrap_or(0);
+                        let (last, since, reported) = STALL.with(|s| s.get());
+                        let since = if last == cur { since.unwrap_or_else(std::time::Instant::now) } else { std::time::Instant::now() };
+                        let mut reported = if last == cur { reported } else { 0 };
+                        let secs = since.elapsed().as_secs() as u32;
+                        for &(ctx, after, off, len) in &self.options.stall_dumps {
+                            if cur == ctx && secs >= after && secs >= reported + after {
+                                reported = secs;
+                                let bytes: Vec<u8> = (0..len)
+                                    .map(|i| self.mem.read(crate::mem::ConstPtr::<u8>::from_bits(base + off + i)))
+                                    .collect();
+                                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                                log!("STALL on screen {:#x} for {}s, +{:#x}: {}", ctx, secs, off, hex);
+                                // Loader list entry being processed (12-byte records).
+                                if len >= 8 {
+                                    let idx = u16::from_le_bytes([bytes[2], bytes[3]]) as u32;
+                                    let list = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                                    if list >= 0x1000 {
+                                        let e: Vec<String> = (0..3)
+                                            .map(|k| format!("{:#x}", self.mem.read(crate::mem::ConstPtr::<u32>::from_bits(list + idx * 12 + 4 * k))))
+                                            .collect();
+                                        log!("STALL list entry #{}: {}", idx, e.join(" "));
+                                    }
+                                }
+                            }
+                        }
+                        STALL.with(|s| s.set((cur, Some(since), reported)));
+                    }
                     if let Some(ref mut window) = self.window {
                         window.set_context(vals, &self.options);
                     }
