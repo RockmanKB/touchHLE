@@ -213,6 +213,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
     <label class="check" for="borderless"><input type="checkbox" id="borderless"> <span class="label" style="margin:0">Start without border</span></label>
     <span class="label">Controllers seen by this page</span>
     <div class="pads" id="pads"><span class="pad-chip">None yet. Press any button on a controller.</span></div>
+    <button type="button" class="btn" id="reset-defaults" title="Puts every setting and binding back to the defaults.">Reset to defaults</button>
   </div>
 
   <div id="listen-banner" class="notice listen" hidden></div>
@@ -346,20 +347,25 @@ code { font-family: var(--font-mono); font-size: .92em; }
   const PAD_LABEL = { A: "A", B: "B", X: "X", Y: "Y", LeftShoulder: "LB/L1", RightShoulder: "RB/R1", LeftTrigger: "LT/L2", RightTrigger: "RT/R2", Back: "Back", Start: "Start", LeftStick: "L-stick click", RightStick: "R-stick click" };
 
   // ---- State ----
+  // Default controller layout (the same for both players): A punch, B kick,
+  // Y jump (RB jumps too), X special (D), LB weapon, Start pause.
+  const PAD_DEFAULT = { punch: "A", kick: "B", jump: "Y", d: "X", attack: "X", pause: "Start", weapon: "LeftShoulder" };
   const DEFAULTS = () => ({
     count: 2,
+    speed: 16.5, // 1.1x
+    dash: 5,     // Short (about 1/3 second)
     players: [
       {
         layout: "manual", controller: 1, padDpad: true, padStick: true,
         moveKeys: ["W", "S", "A", "D"],
         keys: { punch: "J", kick: "K", jump: "Space", d: "L", attack: "J", pause: "P", weapon: "Q" },
-        pad: { punch: "X", kick: "Y", jump: "A", d: "B", attack: "X", pause: "Start", weapon: "LeftShoulder" },
+        pad: { ...PAD_DEFAULT }, xpad: { jump: ["RightShoulder"] },
       },
       {
         layout: "manual", controller: 2, padDpad: true, padStick: true,
         moveKeys: ["Up", "Down", "Left", "Right"],
         keys: { punch: "Keypad 1", kick: "Keypad 2", jump: "Keypad 0", d: "Keypad 3", attack: "Keypad 1", pause: "Keypad Enter", weapon: "Keypad 5" },
-        pad: { punch: "X", kick: "Y", jump: "A", d: "B", attack: "X", pause: "Start", weapon: "LeftShoulder" },
+        pad: { ...PAD_DEFAULT }, xpad: { jump: ["RightShoulder"] },
       },
     ],
   });
@@ -830,6 +836,22 @@ code { font-family: var(--font-mono); font-size: .92em; }
     const s = $("#status"); s.textContent = msg; s.className = "status " + (err ? "err" : "ok");
     clearTimeout(flashTimer); flashTimer = setTimeout(() => { s.textContent = ""; s.className = "status"; }, 5000);
   }
+  // Reset needs a second click within 4 s, so one stray click can't wipe a setup.
+  const resetBtn = $("#reset-defaults");
+  let resetArmed = null;
+  resetBtn.addEventListener("click", () => {
+    if (!resetArmed) {
+      resetBtn.textContent = "Click again to reset everything";
+      resetArmed = setTimeout(() => { resetArmed = null; resetBtn.textContent = "Reset to defaults"; }, 4000);
+      return;
+    }
+    clearTimeout(resetArmed); resetArmed = null;
+    resetBtn.textContent = "Reset to defaults";
+    state = DEFAULTS();
+    save();
+    render();
+  });
+
   $("#copy").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(buildBat()); flash("Copied. Paste into Notepad and save it with a .bat ending, for example Play Double Dragon.bat."); }
     catch (e) {
