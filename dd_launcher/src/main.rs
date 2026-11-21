@@ -1,3 +1,8 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 // Double Dragon launcher: shows the controls page in a window, saves the
 // settings next to the app, and starts touchHLE without a console window.
 // Folder layout (next to DoubleDragon.exe):
@@ -9,7 +14,8 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tao::event::{Event, WindowEvent};
@@ -57,7 +63,10 @@ fn js_string(s: &str) -> String {
     serde_json::Value::String(s.to_string()).to_string()
 }
 
-fn spawn_engine(engine: &Path, args: &[String]) -> std::io::Result<()> {
+/// Game windows started by this launcher (so they can be closed from here).
+type Running = Arc<Mutex<Vec<Child>>>;
+
+fn spawn_engine(engine: &Path, args: &[String], running: &Running) -> std::io::Result<()> {
     let mut cmd = Command::new(engine_exe(engine));
     cmd.args(args).current_dir(engine);
     #[cfg(windows)]
@@ -66,11 +75,13 @@ fn spawn_engine(engine: &Path, args: &[String]) -> std::io::Result<()> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn().map(|_| ())
+    let child = cmd.spawn()?;
+    running.lock().unwrap().push(child);
+    Ok(())
 }
 
 /// Start one or two game windows. Returns a message for the page.
-fn play(base: &Path, msg: &serde_json::Value) -> String {
+fn play(base: &Path, msg: &serde_json::Value, running: &Running) -> String {
     let engine = base.join("engine");
     if !engine_exe(&engine).exists() {
         return "The engine folder is missing touchHLE.exe. Re-download the app.".into();
@@ -95,20 +106,20 @@ fn play(base: &Path, msg: &serde_json::Value) -> String {
     if count >= 2 {
         let mut a = vec![ipa.clone(), "--gamekit-host=47800".into(), sandbox(1)];
         a.extend(list(0));
-        if let Err(e) = spawn_engine(&engine, &a) {
+        if let Err(e) = spawn_engine(&engine, &a, running) {
             return format!("Couldn't start the game: {e}");
         }
         std::thread::sleep(Duration::from_secs(2));
         let mut b = vec![ipa, "--gamekit-join=127.0.0.1:47800".into(), sandbox(2)];
         b.extend(list(1));
-        if let Err(e) = spawn_engine(&engine, &b) {
+        if let Err(e) = spawn_engine(&engine, &b, running) {
             return format!("Player 2's window couldn't start: {e}");
         }
         "Started 2 players.".into()
     } else {
         let mut a = vec![ipa, sandbox(1)];
         a.extend(list(0));
-        if let Err(e) = spawn_engine(&engine, &a) {
+        if let Err(e) = spawn_engine(&engine, &a, running) {
             return format!("Couldn't start the game: {e}");
         }
         "Started 1 player.".into()
@@ -180,6 +191,7 @@ fn main() -> wry::Result<()> {
     };
 
     let status_proxy = event_loop.create_proxy();
+    let running: Running = Arc::new(Mutex::new(Vec::new()));
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -205,10 +217,27 @@ fn main() -> wry::Result<()> {
                         // Starting player 2 waits 2 s; keep the window responsive.
                         let base = base.clone();
                         let p = status_proxy.clone();
+                        let running = running.clone();
                         std::thread::spawn(move || {
-                            let s = play(&base, &msg);
+                            let s = play(&base, &msg, &running);
                             let _ = p.send_event(UserEvent::Status(s));
                         });
+                    }
+                    Some("quit") => {
+                        let mut list = running.lock().unwrap();
+                        let mut closed = 0;
+                        for mut child in list.drain(..) {
+                            if matches!(child.try_wait(), Ok(None)) {
+                                let _ = child.kill();
+                                closed += 1;
+                            }
+                            let _ = child.wait();
+                        }
+                        let s = if closed > 0 { "Game closed." } else { "No game is running." };
+                        let _ = webview.evaluate_script(&format!(
+                            "window.ddAppStatus && window.ddAppStatus({})",
+                            js_string(s)
+                        ));
                     }
                     Some("open") => {
                         let which = msg["folder"].as_str().unwrap_or("game");

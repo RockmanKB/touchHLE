@@ -307,6 +307,17 @@ pub struct Window {
     /// Local: how much the window grew when its border was hidden
     /// (x, y, width, height), to undo when the border comes back.
     border_grow: Option<(i32, i32, i32, i32)>,
+    /// Local: window layout: 0 = normal/split, 1 = player 1 full screen,
+    /// 2 = player 2 full screen (shared with the linked window).
+    layout: u8,
+    /// Local: when the quit combo started being held.
+    quit_held_since: Option<Instant>,
+    /// Local: which player this window is (1 hosts the link, 2 joins it).
+    my_player: u8,
+    /// Local: window position, size and border before going full screen.
+    layout_saved: Option<(i32, i32, u32, u32, bool)>,
+    /// Local: start on this half of the screen (false = left).
+    split: Option<bool>,
     event_pump: sdl2::EventPump,
     event_queue: VecDeque<Event>,
     last_polled: Instant,
@@ -347,6 +358,8 @@ pub struct Window {
     list_game: Option<(i32, i32, i32)>,
     /// Local: scroll value to write into the app.
     list_scroll_write: Option<i32>,
+    /// Local: on a "tap anywhere" screen: where a confirm/back press taps.
+    tap_any: Option<(f32, f32)>,
     combo: ComboState,
     /// Local: analog triggers currently counted as pressed (left, right).
     triggers_down: [bool; 2],
@@ -358,6 +371,13 @@ pub struct Window {
     move_touch_last: HashMap<FingerId, Coords>,
     cursor_last_aim: Option<Instant>,
     plate_followup: Option<(Instant, (f32, f32), bool)>,
+    /// Local: the app's on-screen buttons from the latest frame only.
+    plates_now: Vec<Plate>,
+    /// Local: screen and time the app last had on-screen buttons.
+    plates_last_seen: Option<(u32, Instant)>,
+    /// Local: menu confirm/back presses are ignored until then (right after
+    /// a press the app may be moving to the next screen).
+    plate_tap_block_until: Option<Instant>,
     pending_ups: Vec<(Instant, Event)>,
     ctx_key_taps: Vec<(usize, sdl2::keyboard::Keycode)>,
     ctx_confirm_keys: Vec<sdl2::keyboard::Keycode>,
@@ -583,6 +603,11 @@ impl Window {
             window,
             borderless: options.borderless,
             border_grow: None,
+            layout: 0,
+            quit_held_since: None,
+            my_player: if matches!(options.gamekit_link, Some(crate::options::GameKitLink::Join(_))) { 2 } else { 1 },
+            layout_saved: None,
+            split: options.split,
             event_pump,
             event_queue: VecDeque::new(),
             last_polled: Instant::now() - Duration::from_secs(1),
@@ -623,6 +648,7 @@ impl Window {
             list_busy_until: None,
             list_game: None,
             list_scroll_write: None,
+            tap_any: None,
             combo: ComboState::default(),
             triggers_down: [false; 2],
             plates: Vec::new(),
@@ -633,6 +659,9 @@ impl Window {
             move_touch_last: HashMap::new(),
             cursor_last_aim: None,
             plate_followup: None,
+            plates_now: Vec::new(),
+            plates_last_seen: None,
+            plate_tap_block_until: None,
             pending_ups: Vec::new(),
             ctx_key_taps,
             ctx_confirm_keys,
@@ -656,6 +685,11 @@ impl Window {
         }
         window.internal_gl_ins = Some(gl_ins);
 
+        // Local: split screen for two players.
+        if window.split.is_some() {
+            window.apply_layout(0);
+        }
+
         if window.splash_image.is_some() {
             window.display_splash();
         }
@@ -672,6 +706,7 @@ impl Window {
     /// was called too recently.
     pub fn poll_for_events(&mut self, options: &Options) {
         self.poll_for_events_inner(options);
+        self.check_quit_combo(options);
         self.combo_process(options);
     }
 
@@ -750,6 +785,8 @@ impl Window {
 
         // Local: keys forwarded from the linked instance.
         let mut forwarded = Vec::new();
+        let mut layout_msg: Option<u8> = None;
+        let mut peer_quit = false;
         if let Some(link) = &mut self.key_link {
             let mut buf = [0u8; 128];
             while let Ok((n, from)) = link.socket.recv_from(&mut buf) {
@@ -759,22 +796,36 @@ impl Window {
                         forwarded.push((name.to_string(), true));
                     } else if let Some(name) = s.strip_prefix("U:") {
                         forwarded.push((name.to_string(), false));
+                    } else if s == "Q:" {
+                        // Local: the linked window was closed; close this one too.
+                        peer_quit = true;
+                    } else if let Some(n) = s.strip_prefix("L:").and_then(|n| n.parse::<u8>().ok()) {
+                        layout_msg = Some(n);
                     }
                 }
             }
+        }
+        if let Some(n) = layout_msg {
+            self.apply_layout(n);
+        }
+        if peer_quit {
+            self.event_queue.push_back(Event::Quit);
         }
         // Local: second tap for buttons that only highlighted on the first.
         if let Some((due, at, was_highlighted)) = self.plate_followup {
             if Instant::now() >= due {
                 self.plate_followup = None;
+                // Only buttons still on screen this frame (not ones that
+                // were just removed, e.g. as the screen moves on).
                 let still_waiting = self
-                    .plates
+                    .plates_now
                     .iter()
                     .find(|p| (p.cx - at.0).hypot(p.cy - at.1) < 3.0)
                     .is_some_and(|p| p.flags & 0x100 != 0 && p.flags & 0x2000 == 0);
                 if !was_highlighted && still_waiting {
                     let evs = self.tap_events(at);
                     self.event_queue.extend(evs);
+                    self.plate_tap_block_until = Some(Instant::now() + Duration::from_millis(700));
                 }
             }
         }
@@ -867,6 +918,13 @@ impl Window {
                     ..
                 } => {
                     let pressed = matches!(event, E::KeyDown { .. });
+                    // Local: layout key (split / 1P full / 2P full).
+                    if options.layout_key.as_deref() == Some(k.name().as_str()) {
+                        if pressed {
+                            self.cycle_layout();
+                        }
+                        continue;
+                    }
                     // Local: border toggle key (this window only).
                     if options.border_toggle_key.as_deref() == Some(k.name().as_str()) {
                         if pressed {
@@ -899,6 +957,12 @@ impl Window {
                 E::ControllerButtonDown { button, .. } | E::ControllerButtonUp { button, .. } => {
                     if let Some(b) = translate_button(button) {
                         let pressed = matches!(event, E::ControllerButtonDown { .. });
+                        if options.layout_button == Some(b) {
+                            if pressed {
+                                self.cycle_layout();
+                            }
+                            continue;
+                        }
                         if let Some(evs) = self.context_input(options, CtxInput::Button(b), pressed) {
                             controller_updated = true;
                             self.event_queue.extend(evs);
@@ -950,6 +1014,14 @@ impl Window {
                 _ => {}
             }
 
+            // Local: closing one linked window closes the other too.
+            if matches!(event, E::Quit { .. }) {
+                if let Some(link) = &self.key_link {
+                    if let Some(peer) = link.peer {
+                        let _ = link.socket.send_to(b"Q:", peer);
+                    }
+                }
+            }
             self.event_queue.push_back(match event {
                 E::Quit { .. } => Event::Quit,
                 E::MouseButtonDown {
@@ -1588,6 +1660,8 @@ impl Window {
             let was_menu = self.menu_ctx_active;
             self.plate_user_moved = false;
             self.plate_sel = None;
+            // A follow-up tap is meant for the screen it was made on.
+            self.plate_followup = None;
             self.menu_sel = None;
             self.menu_pointer = None;
             self.menu_ctx_active = self.context.first().is_some_and(|ctx| {
@@ -1647,6 +1721,21 @@ impl Window {
     }
 
     /// Local: is d-pad navigation between the app's on-screen buttons active?
+    /// Local: the buttons on this menu screen have just gone (e.g. sliding
+    /// away after a choice). Until the next screen, input must not turn into
+    /// touches: the app can read a stray touch as cancelling the choice.
+    fn plates_just_gone(&self, options: &Options) -> bool {
+        let Some(&ctx) = self.context.first() else {
+            return false;
+        };
+        options.touch_plates
+            && self.plates.is_empty()
+            && !options.plate_nav_exclude.contains(&ctx)
+            && self
+                .plates_last_seen
+                .is_some_and(|(c, t)| c == ctx && t.elapsed() < Duration::from_millis(2500))
+    }
+
     fn plate_nav_active(&self, options: &Options) -> bool {
         let Some(&ctx) = self.context.first() else {
             return false;
@@ -1665,6 +1754,12 @@ impl Window {
         let now = Instant::now();
         self.plates_seen
             .retain(|(t, _)| now.duration_since(*t) < Duration::from_millis(150));
+        if !plates.is_empty() {
+            if let Some(&ctx) = self.context.first() {
+                self.plates_last_seen = Some((ctx, now));
+            }
+        }
+        self.plates_now = plates.clone();
         self.plates_seen.push((now, plates));
         let best = self
             .plates_seen
@@ -1708,10 +1803,14 @@ impl Window {
             let sel = keep
                 .and_then(|s| self.nearest_plate(s, 6.0))
                 .or_else(|| {
+                    // Start on the app's own buttons; the extra ones added
+                    // here (numbered from 1000, e.g. page arrows) are only
+                    // reached by moving to them.
                     self.plates
                         .iter()
-                        .filter(|p| p.num >= 0)
+                        .filter(|p| p.num >= 0 && p.num < 1000)
                         .min_by_key(|p| p.num)
+                        .or(self.plates.iter().find(|p| p.num < 1000))
                         .or(self.plates.first())
                         .map(|p| (p.cx, p.cy))
                 });
@@ -1764,6 +1863,8 @@ impl Window {
         };
         options.context_menus.iter().any(|m| m.contexts.contains(&ctx))
             || self.plate_nav_active(options)
+            || self.tap_any.is_some()
+            || self.plates_just_gone(options)
     }
 
     /// Local: screen-dependent handling of a button/key press or release.
@@ -1779,6 +1880,24 @@ impl Window {
             return None;
         }
         let ctx = *self.context.first()?;
+
+        // "Tap anywhere" screen (e.g. tutorial pages, a warning): confirm or
+        // back taps once; everything else is ignored so it can't skip ahead.
+        if let Some(at) = self.tap_any {
+            self.ctx_swallowed.insert(input);
+            let confirm = match input {
+                CtxInput::Button(b) => options.menu_confirm_buttons.contains(&b),
+                CtxInput::Key(k) => self.ctx_confirm_keys.contains(&k),
+            };
+            let back = match input {
+                CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
+                CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
+            };
+            if confirm || back {
+                return Some(self.tap_events(at));
+            }
+            return Some(Vec::new());
+        }
 
         // Screen-specific tap for this button/key.
         let tap_idx = options.context_taps.iter().enumerate().position(|(i, t)| {
@@ -1853,6 +1972,10 @@ impl Window {
 
     /// Local: d-pad navigation between the app's on-screen buttons.
     fn plate_nav_input(&mut self, options: &Options, input: CtxInput) -> Option<Vec<Event>> {
+        if self.plates_just_gone(options) {
+            self.ctx_swallowed.insert(input);
+            return Some(Vec::new());
+        }
         if !self.plate_nav_active(options) {
             return None;
         }
@@ -1879,8 +2002,16 @@ impl Window {
             CtxInput::Button(b) => options.menu_back_buttons.contains(&b),
             CtxInput::Key(k) => self.ctx_back_keys.contains(&k),
         };
+        // Right after a press the app may be changing screens; a second
+        // press then (e.g. on the back arrow as it slides away) can leave
+        // the app stuck between screens.
+        if (confirm || back) && dir.is_none() && self.plate_tap_block_until.is_some_and(|t| Instant::now() < t) {
+            self.ctx_swallowed.insert(input);
+            return Some(Vec::new());
+        }
         if back && !confirm && dir.is_none() {
             self.ctx_swallowed.insert(input);
+            self.plate_tap_block_until = Some(Instant::now() + Duration::from_millis(700));
             // The back arrow sits in the top-right corner of menu screens.
             let target = self
                 .plates
@@ -1915,7 +2046,108 @@ impl Window {
             .find(|p| (p.cx - cur.0).hypot(p.cy - cur.1) < 3.0)
             .is_some_and(|p| p.flags & 0x100 != 0);
         self.plate_followup = Some((Instant::now() + Duration::from_millis(220), cur, was_highlighted));
+        self.plate_tap_block_until = Some(Instant::now() + Duration::from_millis(700));
         Some(self.tap_events(cur))
+    }
+
+    /// Local: close the game (and the linked window) after the quit combo has
+    /// been held on any controller for 2 seconds.
+    fn check_quit_combo(&mut self, options: &Options) {
+        if options.quit_combo.is_empty() {
+            return;
+        }
+        let buttons: Vec<sdl2::controller::Button> = options
+            .quit_combo
+            .iter()
+            .filter_map(|n| sdl2::controller::Button::from_string(n))
+            .collect();
+        let held = self
+            .controllers
+            .iter()
+            .any(|c| buttons.iter().all(|&b| c.button(b)));
+        if !held {
+            self.quit_held_since = None;
+            return;
+        }
+        let since = *self.quit_held_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= Duration::from_secs(2) {
+            self.quit_held_since = None;
+            log!("Quit button combo held: closing.");
+            if let Some(link) = &self.key_link {
+                if let Some(peer) = link.peer {
+                    let _ = link.socket.send_to(b"Q:", peer);
+                }
+            }
+            self.event_queue.push_back(Event::Quit);
+        }
+    }
+
+    /// Local: next window layout. Linked windows cycle split -> player 1
+    /// full screen -> player 2 full screen; a single window toggles full screen.
+    fn cycle_layout(&mut self) {
+        let linked = self.key_link.as_ref().is_some_and(|l| l.peer.is_some());
+        let next = if linked {
+            (self.layout + 1) % 3
+        } else if self.layout == 0 {
+            self.my_player
+        } else {
+            0
+        };
+        if let Some(link) = &self.key_link {
+            if let Some(peer) = link.peer {
+                let _ = link.socket.send_to(format!("L:{next}").as_bytes(), peer);
+            }
+        }
+        self.apply_layout(next);
+    }
+
+    /// Local: put the window where layout `n` wants it.
+    fn apply_layout(&mut self, n: u8) {
+        use sdl2::video::WindowPos::Positioned;
+        let display = self.window.display_index().unwrap_or(0);
+        let full = self.video_ctx.display_bounds(display).ok();
+        let usable = self.video_ctx.display_usable_bounds(display).ok().or(full);
+        if n == self.my_player {
+            let Some(full) = full else { return };
+            if self.layout_saved.is_none() {
+                let (x, y) = self.window.position();
+                let (w, h) = self.window.size();
+                self.layout_saved = Some((x, y, w, h, self.borderless));
+            }
+            self.window.set_bordered(false);
+            let _ = self.window.set_size(full.width(), full.height());
+            self.window.set_position(Positioned(full.x()), Positioned(full.y()));
+            self.window.set_always_on_top(true);
+            self.window.raise();
+        } else {
+            self.window.set_always_on_top(false);
+            if n == 0 {
+                if let (Some(right), Some(u)) = (self.split, usable) {
+                    // Each player gets half of the screen, borderless.
+                    self.window.set_bordered(false);
+                    self.borderless = true;
+                    self.border_grow = None;
+                    let half = u.width() / 2;
+                    let x = u.x() + if right { half as i32 } else { 0 };
+                    let _ = self.window.set_size(half, u.height());
+                    self.window.set_position(Positioned(x), Positioned(u.y()));
+                    self.layout_saved = None;
+                } else if let Some((x, y, w, h, borderless)) = self.layout_saved.take() {
+                    self.window.set_bordered(!borderless);
+                    let _ = self.window.set_size(w, h);
+                    self.window.set_position(Positioned(x), Positioned(y));
+                }
+            } else if self.layout == self.my_player {
+                // The other player's window goes full screen: step back to
+                // where this window was.
+                if let Some((x, y, w, h, borderless)) = self.layout_saved.take() {
+                    self.window.set_bordered(!borderless);
+                    let _ = self.window.set_size(w, h);
+                    self.window.set_position(Positioned(x), Positioned(y));
+                }
+            }
+        }
+        self.layout = n;
     }
 
     /// Local: show or hide the window border. The picture grows into the
@@ -1952,6 +2184,15 @@ impl Window {
                 self.window.set_position(Positioned(x + gx), Positioned(y + gy));
             }
         }
+    }
+
+    /// Local: set the current "tap anywhere" spot (see `--context-tap-any=`).
+    pub fn set_tap_any(&mut self, v: Option<(f32, f32)>) {
+        if v.is_some() && self.tap_any.is_none() {
+            // Let go of movement so it doesn't count as a tap.
+            self.release_movement_touches();
+        }
+        self.tap_any = v;
     }
 
     /// Local: the app's live list state (see `--context-list-state=`).
@@ -2137,6 +2378,9 @@ impl Window {
     }
 
     fn tap_events(&mut self, (x, y): (f32, f32)) -> Vec<Event> {
+        if std::env::var("TOUCHHLE_TAP_DEBUG").is_ok() {
+            log!("Tap at ({}, {}) t={}ms", x, y, debug_ms());
+        }
         let coords = transform_input_coords_mapped(self, (x, y), true);
         let fid = FingerId::Context(10_000);
         self.pending_ups.push((
@@ -2422,7 +2666,12 @@ impl Window {
     /// and whether the cursor moved.
     fn update_virtual_cursor(&mut self, options: &Options) -> (f32, f32, bool, bool, bool) {
         // Get right analog stick input. The range is [-1, 1] on each axis.
-        let (x, y, pressed) = self.get_controller_stick(options, false);
+        let (x, y, pressed) = if options.disable_virtual_cursor {
+            // Local: pointer switched off; the stick and its button do nothing.
+            (0.0, 0.0, false)
+        } else {
+            self.get_controller_stick(options, false)
+        };
 
         // Local: only let the tap button (RB / right-stick click) tap when the
         // pointer is actually being used: the stick is tilted now or was in the

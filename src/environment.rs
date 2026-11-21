@@ -1502,8 +1502,23 @@ impl Environment {
                         (read(so) as i32, read(mo) as i32, read(se) as i32, base + so)
                     });
                     if let Some(ref mut window) = self.window {
+                        let first_ctx = vals.first().copied();
                         window.set_context(vals, &self.options);
                         window.set_list_game_state(list_vals.map(|v| (v.0, v.1, v.2)));
+                        // Local: "tap anywhere" screens (some only while a flag is set).
+                        let tap_any = first_ctx.and_then(|ctx| {
+                            self.options.tap_any.iter().find_map(|(ctxs, at, flag)| {
+                                if !ctxs.contains(&ctx) {
+                                    return None;
+                                }
+                                match flag {
+                                    Some((off, mask)) if base >= 0x1000 => (read(*off) & mask != 0).then_some(*at),
+                                    Some(_) => None,
+                                    None => Some(*at),
+                                }
+                            })
+                        });
+                        window.set_tap_any(tap_any);
                         if let (Some(v), Some(addr)) = (window.take_list_scroll_write(), list_vals.map(|v| v.3)) {
                             self.mem.write(crate::mem::MutPtr::<i32>::from_bits(addr), v);
                         }

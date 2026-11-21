@@ -17,9 +17,6 @@ jobs:
       with:
         submodules: recursive
         fetch-depth: 0
-    - name: Unpack Double Dragon files
-      shell: bash
-      run: if [ -f dd_patch.zip ]; then 7z x -y dd_patch.zip; fi
     - name: Download Boost
       run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
     - name: Extract Boost
@@ -39,13 +36,7 @@ jobs:
       run: cargo build --release --manifest-path dd_launcher/Cargo.toml
     - name: Assemble the Double Dragon app folder
       shell: bash
-      run: |
-        D="DoubleDragon_App/Double Dragon"
-        mkdir -p "$D/engine" "$D/game" "$D/config" "$D/saves/player1" "$D/saves/player2"
-        cp dd_launcher/target/release/DoubleDragon.exe "$D/Double Dragon.exe"
-        cp -r touchHLE_windows_bundle/* "$D/engine/"
-        printf 'Put DoubleDragon.ipa in this folder.\r\n' > "$D/game/PUT DoubleDragon.ipa HERE.txt"
-        cp dd_launcher/README.txt "$D/README.txt"
+      run: bash dd_launcher/tools/package.sh
     - uses: actions/upload-artifact@v4
       with:
         name: DoubleDragon_App

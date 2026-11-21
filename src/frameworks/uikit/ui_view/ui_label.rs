@@ -243,6 +243,40 @@ pub const CLASSES: ClassExports = objc_classes! {
     todo_objc_setter!(this, value);
 }
 
+// Local: the size the text needs: one line per line of text, limited to
+// numberOfLines when that's set.
+- (CGSize)sizeThatFits:(CGSize)size {
+    let &mut UILabelHostObject {
+        text,
+        font,
+        line_break_mode,
+        number_of_lines,
+        ..
+    } = env.objc.borrow_mut(this);
+    if text == nil {
+        return CGSize { width: 0.0, height: 0.0 };
+    }
+    let fitted: CGSize = if number_of_lines == 1 {
+        msg![env; text sizeWithFont:font]
+    } else {
+        // Older UIKit (which these apps were made for) measures the text
+        // without a width limit here, so lines only break where the text
+        // has line breaks; apps rely on this to size labels to their text.
+        let _ = size;
+        let width = CGFloat::MAX;
+        let mut fitted: CGSize = msg![env; text sizeWithFont:font
+                                            constrainedToSize:(CGSize { width, height: CGFloat::MAX })
+                                                lineBreakMode:line_break_mode];
+        if number_of_lines > 1 {
+            let line: CGSize = msg![env; text sizeWithFont:font];
+            fitted.height = fitted.height.min(line.height * number_of_lines as CGFloat);
+        }
+        fitted
+    };
+    // Round up so the text wraps the same way when drawn at this size.
+    CGSize { width: fitted.width.ceil(), height: fitted.height.ceil() }
+}
+
 - (())drawRect:(CGRect)_rect {
     let bounds: CGRect = msg![env; this bounds];
     let context = UIGraphicsGetCurrentContext(env);

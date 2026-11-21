@@ -2,7 +2,8 @@
 name = "dd_launcher"
 version = "1.0.0"
 edition = "2021"
-description = "Double Dragon launcher for touchHLE (local, personal use)"
+description = "Unofficial Double Dragon launcher for a modified touchHLE"
+license = "MPL-2.0"
 
 # Not part of touchHLE's workspace.
 [workspace]

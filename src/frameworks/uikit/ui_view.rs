@@ -908,7 +908,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     size
 }
 - (())sizeToFit {
-    log!("TODO: [(UIView *){:?} sizeToFit]", this);
+    // Local: resize to [self sizeThatFits:] (the base implementation returns
+    // the current size, so plain views are unchanged; UILabel overrides it).
+    // The bounds are resized, which keeps the view's center where it was.
+    let bounds: CGRect = msg![env; this bounds];
+    let size: CGSize = msg![env; this sizeThatFits:(bounds.size)];
+    if std::env::var("TOUCHHLE_LABEL_DEBUG").is_ok() {
+        let t: crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform = msg![env; this transform];
+        log!("sizeToFit {:?}: bounds {:?} -> {:?}, transform {:?}", this, bounds.size, size, t);
+    }
+    let new_bounds = CGRect { origin: bounds.origin, size };
+    () = msg![env; this setBounds:new_bounds];
 }
 
 - (())setContentScaleFactor:(CGFloat)factor {

@@ -1,3 +1,17 @@
+# Double Dragon for PC (unofficial touchHLE fork)
+
+This fork of [touchHLE](https://github.com/touchHLE/touchHLE) makes the 2010 iOS version of **Double Dragon** playable on Windows, with keyboard and controller support, 2-player co-op on one PC, and a launcher app for setting up controls.
+
+* **Download:** see [Releases](../../releases).
+* **You need your own copy of the game** (`.ipa`, dumped from your own iOS device). The game is not included.
+* What changed from upstream touchHLE: the `src/` changes (controller and menu input, co-op windows, small UIKit fixes) and the launcher in [`dd_launcher/`](dd_launcher/). See `dd_launcher/README.txt` for setup.
+
+**Not affiliated with or endorsed by** Arc System Works, Bow Mobile or the touchHLE project. The changes in this fork were written with the help of an AI assistant (Claude), so they are **not** suitable for contributing upstream. Please don't report problems with this build to the touchHLE developers.
+
+Licensing is the same as upstream touchHLE (MPL-2.0 for the source; built binaries GPL-3.0-or-later, see below). The launcher in `dd_launcher/` is MPL-2.0.
+
+---
+
 # touchHLE: high-level emulator for early iOS apps
 
 **touchHLE** is a high-level emulator for early iOS apps. It runs on modern desktop operating systems and Android, and is written in Rust.

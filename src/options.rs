@@ -136,6 +136,10 @@ pub struct Options {
     pub dpad_to_touch: Option<(f32, f32, f32, f32)>,
     pub stick_to_touch: Option<(f32, f32, f32, f32)>,
     pub stabilize_virtual_cursor: Option<(f32, f32)>,
+    /// Local: the right stick doesn't move an on-screen pointer.
+    pub disable_virtual_cursor: bool,
+    /// Local: controller buttons that close the game when held together.
+    pub quit_combo: Vec<String>,
     pub gles1_implementation: Option<GLESImplementation>,
     pub direct_memory_access: bool,
     pub gdb_listen_addrs: Option<Vec<SocketAddr>>,
@@ -159,6 +163,9 @@ pub struct Options {
     /// Local: where a list menu's state is in app memory, as offsets from
     /// the context probe base: (screens, scroll px (<= 0), max scroll, selected row).
     pub list_states: Vec<(Vec<u32>, u32, u32, u32)>,
+    /// Local: "tap anywhere" screens: (screens, tap spot, optional
+    /// (offset, mask) that must be set in app memory for the rule to apply).
+    pub tap_any: Vec<(Vec<u32>, (f32, f32), Option<(u32, u32)>)>,
     /// Local: classic combos. Left/right + the button at this spot becomes
     /// up + that button.
     pub classic_headbutt: Option<(f32, f32)>,
@@ -174,6 +181,11 @@ pub struct Options {
     pub border_toggle_key: Option<String>,
     /// Local: start without the window border.
     pub borderless: bool,
+    /// Local: start on the left (false) or right (true) half of the screen.
+    pub split: Option<bool>,
+    /// Local: button/key that cycles split screen -> 1P full -> 2P full.
+    pub layout_button: Option<Button>,
+    pub layout_key: Option<String>,
     pub patches_u32: Vec<(u32, u32, u32)>,
     pub extra_plates: Vec<(Vec<u32>, Vec<[f32; 4]>)>,
     pub menu_back_buttons: Vec<Button>,
@@ -201,6 +213,8 @@ impl Default for Options {
             dpad_to_touch: None,
             stick_to_touch: None,
             stabilize_virtual_cursor: None,
+            disable_virtual_cursor: false,
+            quit_combo: Vec::new(),
             gles1_implementation: None,
             direct_memory_access: true,
             gdb_listen_addrs: None,
@@ -222,6 +236,7 @@ impl Default for Options {
             context_menus: Vec::new(),
             list_menus: Vec::new(),
             list_states: Vec::new(),
+            tap_any: Vec::new(),
             classic_headbutt: None,
             classic_elbow: None,
             menu_confirm_buttons: Vec::new(),
@@ -231,6 +246,9 @@ impl Default for Options {
             stall_dumps: Vec::new(),
             border_toggle_key: None,
             borderless: false,
+            split: None,
+            layout_button: None,
+            layout_key: None,
             patches_u32: Vec::new(),
             extra_plates: Vec::new(),
             menu_back_buttons: Vec::new(),
@@ -401,6 +419,24 @@ impl Options {
             }
             self.classic_elbow = Some([(n[0], n[1]), (n[2], n[3]), (n[4], n[5])]);
             return Ok(true);
+        } else if let Some(value) = arg.strip_prefix("--context-tap-any=") {
+            // SCREEN,X,Y[,OFFSET,MASK]
+            let parts: Vec<&str> = value.split(',').map(|p| p.trim()).collect();
+            if parts.len() != 3 && parts.len() != 5 {
+                return Err("--context-tap-any= requires SCREEN,X,Y[,OFFSET,MASK]".to_string());
+            }
+            let num = |s: &str| -> Result<u32, String> {
+                if let Some(h) = s.strip_prefix("0x") {
+                    u32::from_str_radix(h, 16)
+                } else {
+                    s.parse()
+                }
+                .map_err(|_| "--context-tap-any= numbers are invalid".to_string())
+            };
+            let f = |s: &str| s.parse::<f32>().map_err(|_| "--context-tap-any= X,Y are invalid".to_string());
+            let flag = if parts.len() == 5 { Some((num(parts[3])?, num(parts[4])?)) } else { None };
+            self.tap_any.push((parse_contexts(parts[0])?, (f(parts[1])?, f(parts[2])?), flag));
+            return Ok(true);
         } else if let Some(value) = arg.strip_prefix("--context-list-state=") {
             // SCREEN,SCROLL_OFFSET,MAX_SCROLL_OFFSET,SELECTED_OFFSET
             let parts: Vec<&str> = value.split(',').collect();
@@ -520,10 +556,31 @@ impl Options {
             return Ok(true);
         }
 
-        if let Some(v) = arg.strip_prefix("--border-toggle-key=") {
+        if let Some(v) = arg.strip_prefix("--quit-combo=") {
+            // e.g. back+start (SDL button names), held for 2 seconds.
+            let names: Vec<String> = v.split('+').map(|n| n.trim().to_lowercase()).filter(|n| !n.is_empty()).collect();
+            for n in &names {
+                if sdl2::controller::Button::from_string(n).is_none() {
+                    return Err(format!("--quit-combo=: unknown button {n:?}"));
+                }
+            }
+            self.quit_combo = names;
+        } else if arg == "--disable-virtual-cursor" {
+            self.disable_virtual_cursor = true;
+        } else if let Some(v) = arg.strip_prefix("--border-toggle-key=") {
             self.border_toggle_key = Some(v.to_string());
         } else if arg == "--borderless" {
             self.borderless = true;
+        } else if let Some(v) = arg.strip_prefix("--split=") {
+            self.split = Some(match v {
+                "left" => false,
+                "right" => true,
+                _ => return Err("--split= must be left or right".to_string()),
+            });
+        } else if let Some(v) = arg.strip_prefix("--layout-button=") {
+            self.layout_button = Some(parse_button_name(v)?);
+        } else if let Some(v) = arg.strip_prefix("--layout-key=") {
+            self.layout_key = Some(v.to_string());
         } else if arg == "--fullscreen" {
             self.fullscreen = true;
         } else if arg == "--upside-down" {
