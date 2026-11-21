@@ -162,7 +162,14 @@ fn main() -> wry::Result<()> {
         .build(&event_loop)
         .expect("window");
 
-    let mut ctx = WebContext::new(Some(base.join("config").join("webview")));
+    // The page's browser data (cache etc.) lives in the user's own app-data
+    // folder, not next to the app, so a zipped copy of the app folder never
+    // carries it. Older versions kept it in config/webview; remove that.
+    let webview_dir = std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("DoubleDragon").join("webview"))
+        .unwrap_or_else(|| std::env::temp_dir().join("DoubleDragon-webview"));
+    let _ = std::fs::remove_dir_all(base.join("config").join("webview"));
+    let mut ctx = WebContext::new(Some(webview_dir));
     let url = if cfg!(windows) {
         "http://dd.localhost/index.html"
     } else {
