@@ -201,6 +201,8 @@ code { font-family: var(--font-mono); font-size: .92em; }
       </select></label>
     <label class="check" for="classic" title="Changes the game itself, for both players.">
       <input type="checkbox" id="classic"> <span class="label" style="margin:0">Classic combos</span></label>
+    <label class="check" for="training" title="1 player only: enemies can't be knocked out, don't fight back, and walk back into view if knocked off screen. The clock stops.">
+      <input type="checkbox" id="training"> <span class="label" style="margin:0">Training mode</span></label>
     <label class="check" for="pointer" title="The right stick moves an on-screen pointer, and RB / right-stick click taps with it. Untick to switch the pointer off.">
       <input type="checkbox" id="pointer"> <span class="label" style="margin:0">Right-stick pointer</span></label>
     <label class="check" for="hidepad" title="Removes the on-screen pad and buttons from the game screen. Touch still works in the same spots.">
@@ -230,6 +232,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
         <tr><td class="what">Quitting to the menu</td><td>Includes a fix for the original game's freeze on "Now Loading" after quitting a stage.</td></tr>
         <tr><td class="what">Game speed</td><td>Faster speeds make everything move and react sooner, like a turbo mode; the fight clock counts down faster too. Music and sound effects are not sped up. Both co-op windows always use the same speed.</td></tr>
         <tr><td class="what">Classic combos</td><td>When ticked (top of the page), the game's own move rules change for both players: <b>Left/Right + D</b> does the headbutt and <b>Jump + Punch</b> (Auto mode: <b>Jump + Attack</b>) pressed together does the back elbow, like the older games. Up + D and Down + D become a plain D. Nothing is delayed or faked, so punches and jumps react exactly as normal.</td></tr>
+        <tr><td class="what">Training mode</td><td>For practice and recording: tick it (top of the page) and press <b>Play 1 player</b>. Enemies take hits, get knocked down and count toward chains, but they can't be knocked out and never attack. They stand still, and only walk back into view if they end up off screen or far away. The stage clock stops. It has no effect in 2-player games. Untick it to play normally.</td></tr>
         <tr><td class="what">Tutorial pages</td><td><b>Punch</b>, <b>Jump</b>, <b>Pause</b> (Auto mode: <b>Attack</b>) or <b>D</b> turns one page. Moving is ignored so pages can't be skipped by accident.</td></tr>
         <tr><td class="what">Character and stage pages</td><td>The green side arrows are part of the outline: move onto one and press Punch to change page. In co-op, if both players pick the same character the game shows a warning; press Punch to pick again.</td></tr>
         <tr><td class="what">Fighting</td><td>Everything works as bound above. <b>Pause</b> opens the pause menu.</td></tr>
@@ -315,6 +318,10 @@ code { font-family: var(--font-mono); font-size: .92em; }
 
   // Hide the game's on-screen pad: its four drawing routines return at once.
   const HIDE_PAD_PATCH = ["--patch-u32=0x28fcc,0xaf03b5f0,0xbf004770", "--patch-u32=0x27af4,0xaf02b5b0,0xbf004770", "--patch-u32=0x27b50,0xaf03b5f0,0xbf004770", "--patch-u32=0x27cc0,0xaf02b5b0,0xbf004770"];
+  // Training mode (1 player): enemies take no damage, never attack, only walk
+  // when off screen or far away (so they come back into view), and the stage
+  // clock stops. Built by training.py from the game's armv7 code.
+  const TRAINING_PATCH = ["--patch-u32=0x1e00,0x0,0xbfb42800", "--patch-u32=0x1e04,0x0,0x46702000", "--patch-u32=0x1e08,0x0,0xbd00", "--patch-u32=0x1e20,0x0,0x316df992", "--patch-u32=0x1e24,0x0,0xbfb82b00", "--patch-u32=0x1e28,0x0,0xf8d24770", "--patch-u32=0x1e2c,0x0,0xf00b3134", "--patch-u32=0x1e30,0x0,0xbd87", "--patch-u32=0x1e40,0x0,0x41f0e92d", "--patch-u32=0x1e44,0x0,0x46174606", "--patch-u32=0x1e48,0x0,0x305cf8d4", "--patch-u32=0x1e4c,0x0,0x70fff64f", "--patch-u32=0x1e50,0x0,0x70fff6c7", "--patch-u32=0x1e54,0x0,0x5c50f242", "--patch-u32=0x1e58,0x0,0x100cf855", "--patch-u32=0x1e5c,0x0,0x6c8ab151", "--patch-u32=0x1e60,0x0,0x4f00f412", "--patch-u32=0x1e64,0x0,0x6dcad106", "--patch-u32=0x1e68,0x0,0xbfb81ad2", "--patch-u32=0x1e6c,0x0,0x42824252", "--patch-u32=0x1e70,0x0,0x4610bfb8", "--patch-u32=0x1e74,0x0,0x5c54f242", "--patch-u32=0x1e78,0x0,0x100cf855", "--patch-u32=0x1e7c,0x0,0x6c8ab151", "--patch-u32=0x1e80,0x0,0x4f00f412", "--patch-u32=0x1e84,0x0,0x6dcad106", "--patch-u32=0x1e88,0x0,0xbfb81ad2", "--patch-u32=0x1e8c,0x0,0x42824252", "--patch-u32=0x1e90,0x0,0x4610bfb8", "--patch-u32=0x1e94,0x0,0xdc092896", "--patch-u32=0x1e98,0x0,0x7ca0f244", "--patch-u32=0x1e9c,0x0,0x100cf855", "--patch-u32=0x1ea0,0x0,0x2a141a5a", "--patch-u32=0x1ea4,0x0,0xf5b2db02", "--patch-u32=0x1ea8,0x0,0xdd1a7fe6", "--patch-u32=0x1eac,0x0,0x46214630", "--patch-u32=0x1eb0,0x0,0xf8d447b8", "--patch-u32=0x1eb4,0x0,0xf00220d4", "--patch-u32=0x1eb8,0x0,0xf8c4020f", "--patch-u32=0x1ebc,0x0,0xf8d420d4", "--patch-u32=0x1ec0,0x0,0xf00220d8", "--patch-u32=0x1ec4,0x0,0xf8c4020f", "--patch-u32=0x1ec8,0x0,0xf8d420d8", "--patch-u32=0x1ecc,0x0,0xf00220dc", "--patch-u32=0x1ed0,0x0,0xf8c4020f", "--patch-u32=0x1ed4,0x0,0xf8d420dc", "--patch-u32=0x1ed8,0x0,0xf00220e0", "--patch-u32=0x1edc,0x0,0xf8c4020f", "--patch-u32=0x1ee0,0x0,0xe8bd20e0", "--patch-u32=0x1ee4,0x0,0x81f0", "--patch-u32=0xd934,0xbd004670,0xba64f7f4", "--patch-u32=0xd93c,0x3134f8d2,0xba70f7f4", "--patch-u32=0x12950,0x3b015a43,0xbf005a43", "--patch-u32=0x16c6c,0x46210003,0xf7eb0003", "--patch-u32=0x16c70,0x68e44790,0x68e4f8e7"];
   const CLASSIC_PATCH = ["--patch-u32=0x2400,0x0,0x7f88f411", "--patch-u32=0x2404,0x0,0xf011d012", "--patch-u32=0x2408,0x0,0xd00f0f40", "--patch-u32=0x240c,0x0,0x46214630", "--patch-u32=0x2410,0x0,0xfba0f00a", "--patch-u32=0x2414,0x0,0x7200f643", "--patch-u32=0x2418,0x0,0x20df2c0", "--patch-u32=0x241c,0x0,0x23306812", "--patch-u32=0x2420,0x0,0x46214630", "--patch-u32=0x2424,0x0,0xfe16f00c", "--patch-u32=0x2428,0x0,0xbdf5f033", "--patch-u32=0x242c,0x0,0x880f011", "--patch-u32=0x2430,0x0,0x3179f894", "--patch-u32=0x2434,0x0,0xbdd4f033", "--patch-u32=0x2440,0x0,0x20d8f8d4", "--patch-u32=0x2444,0x0,0x7f88f412", "--patch-u32=0x2448,0x0,0xf894d02d", "--patch-u32=0x244c,0x0,0x3b01316c", "--patch-u32=0x2450,0x0,0x30ff003", "--patch-u32=0x2454,0x0,0x283eb04", "--patch-u32=0x2458,0x0,0x20e4f8d2", "--patch-u32=0x245c,0x0,0xf40f012", "--patch-u32=0x2460,0x0,0x3b01d111", "--patch-u32=0x2464,0x0,0x30ff003", "--patch-u32=0x2468,0x0,0x283eb04", "--patch-u32=0x246c,0x0,0x20e4f8d2", "--patch-u32=0x2470,0x0,0xf40f012", "--patch-u32=0x2474,0x0,0x6f22d017", "--patch-u32=0x2478,0x0,0x1ad26fa3", "--patch-u32=0x247c,0x0,0x1a9b6ea3", "--patch-u32=0x2480,0x0,0x141b66a3", "--patch-u32=0x2484,0x0,0x46286623", "--patch-u32=0x2488,0x0,0xf00a4621", "--patch-u32=0x248c,0x0,0xf643fb63", "--patch-u32=0x2490,0x0,0xf2c07200", "--patch-u32=0x2494,0x0,0x6812020d", "--patch-u32=0x2498,0x0,0x46282330", "--patch-u32=0x249c,0x0,0xf00c4621", "--patch-u32=0x24a0,0x0,0xf030fdd9", "--patch-u32=0x24a4,0x0,0x4628bf5b", "--patch-u32=0x24a8,0x0,0xf00f4621", "--patch-u32=0x24ac,0x0,0xbf00bb39", "--patch-u32=0x2500,0x0,0xf40f015", "--patch-u32=0x2504,0x0,0xf894d02d", "--patch-u32=0x2508,0x0,0x3b01316c", "--patch-u32=0x250c,0x0,0x30ff003", "--patch-u32=0x2510,0x0,0x283eb04", "--patch-u32=0x2514,0x0,0x20e4f8d2", "--patch-u32=0x2518,0x0,0x7f88f412", "--patch-u32=0x251c,0x0,0x3b01d109", "--patch-u32=0x2520,0x0,0x30ff003", "--patch-u32=0x2524,0x0,0x283eb04", "--patch-u32=0x2528,0x0,0x20e4f8d2", "--patch-u32=0x252c,0x0,0x7f88f412", "--patch-u32=0x2530,0x0,0x4630d017", "--patch-u32=0x2534,0x0,0xf00a4621", "--patch-u32=0x2538,0x0,0xf643fb0d", "--patch-u32=0x253c,0x0,0xf2c07200", "--patch-u32=0x2540,0x0,0x6812020d", "--patch-u32=0x2544,0x0,0x46302330", "--patch-u32=0x2548,0x0,0xf00c4621", "--patch-u32=0x254c,0x0,0x4630fd83", "--patch-u32=0x2550,0x0,0xf00a4621", "--patch-u32=0x2554,0x0,0x2000ffa5", "--patch-u32=0x2558,0x0,0xd14f1a7", "--patch-u32=0x255c,0x0,0x500e8bd", "--patch-u32=0x2560,0x0,0xf04fbdf0", "--patch-u32=0x2564,0x0,0xf00a0201", "--patch-u32=0x2568,0x0,0xbf00bde3", "--patch-u32=0x35fd8,0x880f011,0xba12f7cc", "--patch-u32=0x33320,0xf7de6463,0xf7cf6463", "--patch-u32=0x33324,0x4628fbfd,0x4628f88d", "--patch-u32=0x33388,0xf7d94606,0xf7cf4606", "--patch-u32=0x3338c,0x69a3fed1,0x69a3f8b9", "--patch-u32=0x35fe8,0xf01f015,0xf0af015", "--patch-u32=0x36000,0xd00a0a04,0xd00a0a00"];
 
   // ---- Game speed: the game's frame interval (1/15 s) is stored as a double in
@@ -520,6 +527,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
     $("#speed").value = String(state.speed || 15);
     $("#classic").checked = !!state.classic;
     $("#hidepad").checked = !!state.hidePad;
+    $("#training").checked = !!state.training;
     $("#pointer").checked = !state.noPointer;
     $("#quitcombo").value = state.quitCombo === undefined ? "back+start" : state.quitCombo;
     $("#dash").value = String(state.dash || 16);
@@ -601,6 +609,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
     // Down + D); Up/Down + D become a plain D.
     if (state.classic) a.push(...CLASSIC_PATCH);
     if (state.hidePad) a.push(...HIDE_PAD_PATCH);
+    if (state.training && count === 1) a.push(...TRAINING_PATCH);
     if (state.noPointer && pl.controller) a.push("--disable-virtual-cursor");
     const qc = state.quitCombo === undefined ? "back+start" : state.quitCombo;
     if (qc && pl.controller) a.push(`--quit-combo=${qc}`);
@@ -765,6 +774,7 @@ code { font-family: var(--font-mono); font-size: .92em; }
     if (t.id === "speed") { state.speed = Number(t.value); render(); }
     if (t.id === "classic") { state.classic = t.checked; render(); }
     if (t.id === "hidepad") { state.hidePad = t.checked; render(); }
+    if (t.id === "training") { state.training = t.checked; render(); }
     if (t.id === "pointer") { state.noPointer = !t.checked; render(); }
     if (t.id === "quitcombo") { state.quitCombo = t.value; render(); }
     if (t.id === "dash") { state.dash = Number(t.value); render(); }
